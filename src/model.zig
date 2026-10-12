@@ -252,7 +252,8 @@ pub const Client = struct {
     /// The scopes the client may ask for.
     scopes: []const []const u8 = &.{},
     token: enum { jwt, opaque_token } = .jwt,
-    /// Which key signs its JWTs; null means the provider's first key.
+    /// Which key signs its JWTs; null means the provider's first key. An `alg` that no key in
+    /// `Identity.keys` has fails the load whatever `Options.on_unsupported` says.
     alg: ?Alg = null,
     /// When set, every token the client gets is wrong in this one way.
     defect: ?Defect = null,

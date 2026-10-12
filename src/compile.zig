@@ -4,17 +4,18 @@
 //! The checks here are the ones the model types state: a service name, an operation id within
 //! its service and a security scheme name within its service are each used once; every scheme a
 //! requirement names is declared; no scheme an operation's requirements name is of a kind mock
-//! does not implement; and no schema sets `pattern` or carries a keyword other than the
-//! annotations `Schema.other_keywords` lists.
+//! does not implement; no schema sets `pattern` or carries a keyword other than the annotations
+//! `Schema.other_keywords` lists; and every identity client's `alg` names a key the provider holds.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const model = @import("model.zig");
 
-/// The most text the load report lists: the bytes of the service names, operation ids, pointers
-/// and names its lines hold (design section 3, Bounds). Past it, lines are counted in
-/// `Diagnostics.unlisted` instead. A default that `Options.limits` is to take over when it exists.
-const default_report_text_max: usize = 1 << 20;
+/// The most memory the load report holds: each listed line's record and the bytes of the service
+/// name, operation id, pointer and name it holds (design section 3, Bounds). Past it, lines are
+/// counted in `Diagnostics.unlisted` instead. A default that `Options.limits` is to take over when
+/// it exists.
+const default_report_max: usize = 1 << 20;
 
 pub const Options = struct {
     /// What a refusal does to the load.
@@ -23,9 +24,10 @@ pub const Options = struct {
     /// - `.refuse_operation`: the load succeeds, and each operation that needs something refused
     ///   is marked refused in `Compiled.refused`; the rest are served. A refusal that no
     ///   operation needs, such as a scheme name used twice that no requirement names, refuses
-    ///   nothing. A service name used twice still fails the load, because the name is how the
-    ///   service is addressed and no operation of either service could be told apart from the
-    ///   other's.
+    ///   nothing. Two refusals still fail the load. A service name used twice, because the name
+    ///   is how the service is addressed and no operation of either service could be told apart
+    ///   from the other's. And an identity client whose `alg` names no key the provider holds,
+    ///   because clients are the test's own configuration, not part of an API it imports.
     ///
     /// Under either setting, a line of reason `.unsupported_scheme_kind_unused` refuses nothing
     /// and fails no load.
@@ -34,18 +36,20 @@ pub const Options = struct {
 
 /// One line of the load report.
 pub const Refusal = struct {
-    service: []const u8,
-    /// Null when the refused item is in the service rather than in one operation: a scheme it
-    /// declares, or the requirements it gives operations whose own `security` is null.
+    /// Null when the refused item is in no service: an identity client.
+    service: ?[]const u8,
+    /// Null when the refused item is not in one operation: a scheme a service declares, the
+    /// requirements it gives operations whose own `security` is null, or an identity client.
     operation: ?[]const u8,
     /// A JSON pointer (RFC 6901) from the model's root to the refused item, through the model
     /// types' field names and slice indices, such as
     /// "/services/0/operations/2/parameters/0/schema/items". A schema reached by more than one path
-    /// is named by the first path the check took.
+    /// is named by the first in field order: the check goes depth first, through each schema's
+    /// children in the order of `Schema`'s fields.
     pointer: []const u8,
     reason: Reason,
-    /// What was refused: the keyword, the scheme a requirement names, the scheme kind, or the name
-    /// used twice.
+    /// What was refused: the keyword, the scheme a requirement names, the scheme kind, the name
+    /// used twice, or the `alg` a client names.
     name: []const u8,
 
     pub const Reason = enum {
@@ -60,18 +64,29 @@ pub const Refusal = struct {
         /// fails no load under either `Options.on_unsupported` and marks no operation.
         unsupported_scheme_kind_unused,
         unsupported_keyword,
+        /// An identity client whose `alg` names no key the provider holds.
+        no_key_for_alg,
     };
 
     /// Writes the refusal as one line with no line break, such as
     /// `service "pets", operation "getPet", /services/0/operations/0/parameters/0/schema:
-    /// unsupported keyword "not"`. Names are written as JSON strings, so a name holding a quote
-    /// or a line break still gives one line. A line that refuses nothing ends
-    /// `named by no requirement, refuses nothing`.
+    /// unsupported keyword "not"`. A line in no service starts at its pointer. Names are written
+    /// as JSON strings, with each byte that is not part of a valid UTF-8 sequence written as
+    /// U+FFFD, so a name holding a quote, a line break or invalid UTF-8 still gives one line of
+    /// valid UTF-8; the report itself keeps the name's bytes as they were. A line that refuses
+    /// nothing ends `named by no requirement, refuses nothing`.
     ///
     /// Errors: `error.WriteFailed` when `w` fails.
     pub fn format(r: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        try w.print("service {f}", .{std.json.fmt(r.service, .{})});
-        if (r.operation) |id| try w.print(", operation {f}", .{std.json.fmt(id, .{})});
+        if (r.service) |service| {
+            try w.writeAll("service ");
+            try writeName(w, service);
+            if (r.operation) |id| {
+                try w.writeAll(", operation ");
+                try writeName(w, id);
+            }
+            try w.writeAll(", ");
+        }
         const what = switch (r.reason) {
             .duplicate_service_name => "service name used twice",
             .duplicate_operation_id => "operation id used twice",
@@ -79,42 +94,71 @@ pub const Refusal = struct {
             .unknown_scheme => "no security scheme named",
             .unsupported_scheme_kind, .unsupported_scheme_kind_unused => "unsupported security scheme kind",
             .unsupported_keyword => "unsupported keyword",
+            .no_key_for_alg => "no key of the identity provider has alg",
         };
-        try w.print(", {s}: {s} {f}", .{ r.pointer, what, std.json.fmt(r.name, .{}) });
+        try w.print("{s}: {s} ", .{ r.pointer, what });
+        try writeName(w, r.name);
         if (r.reason == .unsupported_scheme_kind_unused) try w.writeAll(", named by no requirement, refuses nothing");
     }
 };
+
+/// Writes `name` as a JSON string, each byte that is not part of a valid UTF-8 sequence as
+/// U+FFFD. `std.json.fmt` would write such a name as an array of numbers.
+fn writeName(w: *std.Io.Writer, name: []const u8) std.Io.Writer.Error!void {
+    try w.writeByte('"');
+    // The start of the valid sequences not yet written.
+    var start: usize = 0;
+    var i: usize = 0;
+    while (i < name.len) {
+        const len: usize = std.unicode.utf8ByteSequenceLength(name[i]) catch 0;
+        if (len != 0 and len <= name.len - i and std.unicode.utf8ValidateSlice(name[i..][0..len])) {
+            i += len;
+            continue;
+        }
+        try std.json.Stringify.encodeJsonStringChars(name[start..i], .{}, w);
+        try w.writeAll("\u{FFFD}");
+        i += 1;
+        start = i;
+    }
+    try std.json.Stringify.encodeJsonStringChars(name[start..], .{}, w);
+    try w.writeByte('"');
+}
 
 /// Carries the load report out of `compile`, which a Zig error cannot.
 pub const Diagnostics = struct {
     /// The lines of the last load given this `Diagnostics`, in the order the checks met them:
     /// each service in turn, and in a service its name, its schemes, its requirements, then each
-    /// operation. Listed until the next line's text (its service name, operation id, pointer and
-    /// name) would take the report past 1 MiB; that line and every one after it are counted in
-    /// `unlisted` instead. Empty after a load with nothing to report, and after
+    /// operation; then the identity provider's clients. Listed while the memory they take stays
+    /// within `report_max`: each line's record, and the bytes of its service name, operation id,
+    /// pointer and name. The first line that would take it past and every one after it are
+    /// counted in `unlisted` instead. Empty after a load with nothing to report, and after
     /// `error.OutOfMemory`.
     report: []const Refusal = &.{},
     /// The lines past the bound: counted, not listed. The load's outcome is the same as if they
     /// had been listed.
-    unlisted: usize = 0,
-    arena: std.heap.ArenaAllocator.State = .init,
+    unlisted: u64 = 0,
+    /// The bound `report` was built with, in bytes.
+    report_max: usize = default_report_max,
+    /// The bytes the strings in `report` point into.
+    text: []const u8 = &.{},
 
     /// Frees the report and leaves `d` empty and reusable. `gpa` is the allocator given to the
     /// load that filled it.
     pub fn deinit(d: *Diagnostics, gpa: Allocator) void {
-        d.arena.promote(gpa).deinit();
+        gpa.free(d.report);
+        gpa.free(d.text);
         d.* = .{};
     }
 
     /// Writes each line of the report, each ending in a line break, then, when lines are past
-    /// the bound, a last line with their count, such as
-    /// `2 more not listed: the report keeps at most 1048576 bytes of text`.
+    /// the bound, a last line with their count and the bound, such as
+    /// `2 more not listed: the report keeps at most 1048576 bytes`.
     ///
     /// Errors: `error.WriteFailed` when `w` fails.
     pub fn format(d: Diagnostics, w: *std.Io.Writer) std.Io.Writer.Error!void {
         for (d.report) |line| try w.print("{f}\n", .{line});
         if (d.unlisted != 0) {
-            try w.print("{d} more not listed: the report keeps at most {d} bytes of text\n", .{ d.unlisted, default_report_text_max });
+            try w.print("{d} more not listed: the report keeps at most {d} bytes\n", .{ d.unlisted, d.report_max });
         }
     }
 };
@@ -146,23 +190,23 @@ pub const Error = error{
 /// as on `error.ModelRefused`; free it with `diag.deinit(gpa)`.
 ///
 /// Errors:
-/// - `error.ModelRefused` when there is any refusal under `.refuse_model`, or a service name used
-///   twice under either setting. A line of reason `.unsupported_scheme_kind_unused` is not a
-///   refusal here. Lines past the report's bound count exactly as listed ones do;
+/// - `error.ModelRefused` when there is any refusal under `.refuse_model`, or, under either
+///   setting, a service name used twice or a client whose `alg` names no key. A line of reason
+///   `.unsupported_scheme_kind_unused` is not a refusal here. Lines past the report's bound count
+///   exactly as listed ones do;
 /// - `error.OutOfMemory`, after which `diag` holds an empty report.
 pub fn compile(gpa: Allocator, m: *const model.Model, options: Options, diag: ?*Diagnostics) Error!Compiled {
-    var arena: std.heap.ArenaAllocator = .init(gpa);
-    var checked = check(gpa, arena.allocator(), m) catch |err| {
-        arena.deinit();
-        if (diag) |d| d.deinit(gpa);
-        return err;
-    };
+    // Freed first, so that whatever this load returns, no earlier report is left in `diag`.
+    if (diag) |d| d.deinit(gpa);
+    var checked = try check(gpa, m, default_report_max);
     if (diag) |d| {
-        d.deinit(gpa);
-        d.* = .{ .report = checked.report, .unlisted = checked.unlisted, .arena = arena.state };
-    } else arena.deinit();
+        d.* = .{ .report = checked.report, .unlisted = checked.unlisted, .report_max = default_report_max, .text = checked.text };
+    } else {
+        gpa.free(checked.report);
+        gpa.free(checked.text);
+    }
 
-    if (checked.model_wide or (checked.refusals != 0 and options.on_unsupported == .refuse_model)) {
+    if (checked.model_wide or (checked.refused_any and options.on_unsupported == .refuse_model)) {
         checked.compiled.deinit(gpa);
         return error.ModelRefused;
     }
@@ -172,16 +216,18 @@ pub fn compile(gpa: Allocator, m: *const model.Model, options: Options, diag: ?*
 const Checked = struct {
     compiled: Compiled,
     report: []const Refusal,
-    unlisted: usize,
-    /// The lines, listed or not, that refuse something: all but those of reason
-    /// `.unsupported_scheme_kind_unused`. The decision counts these, never `report.len`, so that
-    /// the bound on the report cannot change it.
-    refusals: usize,
+    text: []const u8,
+    unlisted: u64,
+    /// Some line, listed or not, refuses something: one of any reason but
+    /// `.unsupported_scheme_kind_unused`. The decision reads this flag, never `report.len` and
+    /// never a count, so that neither the bound on the report nor a count that wraps can change
+    /// it.
+    refused_any: bool,
     /// Some refusal concerns the whole model, so no setting lets it load.
     model_wide: bool,
 };
 
-fn check(gpa: Allocator, arena: Allocator, m: *const model.Model) Allocator.Error!Checked {
+fn check(gpa: Allocator, m: *const model.Model, report_max: usize) Allocator.Error!Checked {
     const refused = try gpa.alloc([]bool, m.services.len);
     var rows: usize = 0;
     errdefer {
@@ -194,22 +240,25 @@ fn check(gpa: Allocator, arena: Allocator, m: *const model.Model) Allocator.Erro
         rows += 1;
     }
 
-    var checker: Checker = .{ .gpa = gpa, .arena = arena };
+    var checker: Checker = .{ .gpa = gpa, .report_max = report_max };
     defer checker.deinit();
     try checker.checkModel(m, refused);
+    const text = try gpa.dupe(u8, checker.text.items);
+    errdefer gpa.free(text);
     return .{
         .compiled = .{ .refused = refused },
-        .report = checker.report.items,
+        .report = try checker.takeReport(text),
+        .text = text,
         .unlisted = checker.unlisted,
-        .refusals = checker.refusals,
+        .refused_any = checker.refused_any,
         .model_wide = checker.model_wide,
     };
 }
 
-/// Where in the model a check is: a service, or one of its operations.
+/// Where in the model a check is: the model itself, a service, or one of its operations.
 const Site = struct {
-    service: *const model.Service,
-    s: usize,
+    service: ?*const model.Service = null,
+    s: usize = 0,
     operation: ?*const model.Operation = null,
     o: usize = 0,
 };
@@ -218,8 +267,8 @@ const Site = struct {
 const Root = union(enum) {
     parameter: usize,
     request_content: usize,
-    response_header: struct { usize, usize },
-    response_content: struct { usize, usize },
+    response_header: struct { response: usize, header: usize },
+    response_content: struct { response: usize, content: usize },
 };
 
 /// How the walk reached a schema from the one before it, or from its root.
@@ -245,30 +294,115 @@ const Pending = struct {
     step: usize,
 };
 
+/// A listed line while the report is built. Its strings are spans of `Checker.text`, which moves
+/// as it grows.
+const Line = struct {
+    service: ?Span,
+    operation: ?Span,
+    pointer: Span,
+    reason: Refusal.Reason,
+    name: Span,
+};
+
+const Span = struct {
+    start: usize,
+    len: usize,
+
+    fn of(span: Span, text: []const u8) []const u8 {
+        return text[span.start..][0..span.len];
+    }
+};
+
+/// A name from the model, and the index of the service, scheme or operation that holds it.
+///
+/// Names are checked by sorting these, never through a hash map: std's string hash maps hash with
+/// the fixed seed 0 (`std.hash_map.hashString`), so a model could hold names chosen to collide.
+/// 40,000 operation ids sharing one hash took 48 s to load in a Debug build, against 23 ms for
+/// ids that do not collide. Sorting costs O(n log n) comparisons whatever the names are.
+const Name = struct {
+    name: []const u8,
+    index: usize,
+    /// Set on the first entry of a declared scheme's name: whether a requirement naming it is
+    /// refused.
+    refused: bool = false,
+};
+
+/// Fills `names` with the `field` of each of `items`, sorted by name and then by index, so that
+/// the first entry of each name is its first use.
+fn sortNames(gpa: Allocator, names: *std.ArrayList(Name), items: anytype, comptime field: []const u8) Allocator.Error!void {
+    names.clearRetainingCapacity();
+    try names.ensureTotalCapacity(gpa, items.len);
+    for (items, 0..) |item, i| names.appendAssumeCapacity(.{ .name = @field(item, field), .index = i });
+    std.mem.sort(Name, names.items, {}, nameLessThan);
+}
+
+fn nameLessThan(_: void, a: Name, b: Name) bool {
+    return switch (std.mem.order(u8, a.name, b.name)) {
+        .lt => true,
+        .gt => false,
+        .eq => a.index < b.index,
+    };
+}
+
+/// The first entry of `name` in `sorted`, which `sortNames` filled, or null.
+fn findName(sorted: []Name, name: []const u8) ?*Name {
+    const k = std.sort.lowerBound(Name, sorted, name, orderName);
+    if (k == sorted.len or !std.mem.eql(u8, sorted[k].name, name)) return null;
+    return &sorted[k];
+}
+
+fn orderName(name: []const u8, entry: Name) std.math.Order {
+    return std.mem.order(u8, name, entry.name);
+}
+
+fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.lessThan(u8, a, b);
+}
+
+fn orderString(name: []const u8, item: []const u8) std.math.Order {
+    return std.mem.order(u8, name, item);
+}
+
 const Checker = struct {
     gpa: Allocator,
-    /// Holds the report: every listed `Refusal` and every string in one.
-    arena: Allocator,
-    report: std.ArrayList(Refusal) = .empty,
-    /// The text of the listed lines, never more than `text_max`.
-    text: usize = 0,
-    text_max: usize = default_report_text_max,
+    /// The most memory the report may take: `Diagnostics.report_max`.
+    report_max: usize,
+    /// The listed lines and their text. `check` copies them out into allocations of exactly their
+    /// size, so that what grew here while the report was built leaves nothing in the report.
+    lines: std.ArrayList(Line) = .empty,
+    text: std.ArrayList(u8) = .empty,
+    /// The memory the listed lines will take in the report, never more than `report_max`.
+    listed_bytes: usize = 0,
     /// Lines left out of `report` for the bound. Once one is, every later one is too, so the
-    /// listed lines are always the first ones.
-    unlisted: usize = 0,
-    /// Lines, listed or not, that refuse something.
-    refusals: usize = 0,
+    /// listed lines are always the first ones. 64 bits and saturating, because a `usize` can
+    /// wrap: a shared schema is checked again for each operation that reaches it, so a 32-bit
+    /// target can meet more lines than it can count.
+    unlisted: u64 = 0,
+    refused_any: bool = false,
     model_wide: bool = false,
+
+    // Names sorted for lookup; see `Name`. The last three are reused for each service.
+    service_names: std.ArrayList(Name) = .empty,
+    schemes: std.ArrayList(Name) = .empty,
+    ids: std.ArrayList(Name) = .empty,
+    /// The scheme names some operation's requirements use.
+    used_schemes: std.ArrayList([]const u8) = .empty,
 
     // Scratch for the schema walk, reused for each operation.
     visited: std.AutoHashMapUnmanaged(*const model.Schema, void) = .empty,
     stack: std.ArrayList(Pending) = .empty,
     trail: std.ArrayList(Step) = .empty,
     chain: std.ArrayList(usize) = .empty,
-    /// A line's pointer while it is built, copied into the arena only if the line is listed.
+    /// A line's pointer while it is built, copied into `text` only if the line is listed.
     pointer: std.ArrayList(u8) = .empty,
 
     fn deinit(c: *Checker) void {
+        c.lines.deinit(c.gpa);
+        c.text.deinit(c.gpa);
+        c.service_names.deinit(c.gpa);
+        c.schemes.deinit(c.gpa);
+        c.ids.deinit(c.gpa);
+        c.used_schemes.deinit(c.gpa);
         c.visited.deinit(c.gpa);
         c.stack.deinit(c.gpa);
         c.trail.deinit(c.gpa);
@@ -276,75 +410,105 @@ const Checker = struct {
         c.pointer.deinit(c.gpa);
     }
 
+    /// The listed lines as refusals whose strings point into `text`, a copy of `c.text`.
+    fn takeReport(c: *Checker, text: []const u8) Allocator.Error![]const Refusal {
+        const report = try c.gpa.alloc(Refusal, c.lines.items.len);
+        for (report, c.lines.items) |*r, line| r.* = .{
+            .service = if (line.service) |span| span.of(text) else null,
+            .operation = if (line.operation) |span| span.of(text) else null,
+            .pointer = line.pointer.of(text),
+            .reason = line.reason,
+            .name = line.name.of(text),
+        };
+        return report;
+    }
+
     fn checkModel(c: *Checker, m: *const model.Model, refused: []const []bool) Allocator.Error!void {
-        var names: std.StringHashMapUnmanaged(void) = .empty;
-        defer names.deinit(c.gpa);
+        try sortNames(c.gpa, &c.service_names, m.services, "name");
         for (m.services, refused, 0..) |*service, service_refused, s| {
             const at: Site = .{ .service = service, .s = s };
-            if ((try names.getOrPut(c.gpa, service.name)).found_existing) {
+            if (findName(c.service_names.items, service.name).?.index != s) {
                 c.model_wide = true;
                 try c.refuse(at, "/name", .{}, .duplicate_service_name, service.name);
             }
             try c.checkService(at, service_refused);
         }
+        if (m.identity) |identity| try c.checkIdentity(identity);
+    }
+
+    /// A client's `alg` must name a key the provider holds. A null `alg` names none: it takes the
+    /// provider's first key (design section 2).
+    fn checkIdentity(c: *Checker, identity: model.Identity) Allocator.Error!void {
+        var held: std.EnumSet(model.Alg) = .initEmpty();
+        for (identity.keys) |key| held.insert(key.alg);
+        for (identity.clients, 0..) |client, i| {
+            const alg = client.alg orelse continue;
+            if (held.contains(alg)) continue;
+            c.model_wide = true;
+            try c.refuse(.{}, "/identity/clients/{d}/alg", .{i}, .no_key_for_alg, @tagName(alg));
+        }
     }
 
     fn checkService(c: *Checker, at: Site, refused: []bool) Allocator.Error!void {
-        const service = at.service;
+        const service = at.service.?;
 
         // Every scheme name some operation's requirements use: its own, or the service's when
         // its own `security` is null. A scheme of a kind mock does not implement is refused only
         // where one of these names it.
-        var used: std.StringHashMapUnmanaged(void) = .empty;
-        defer used.deinit(c.gpa);
+        c.used_schemes.clearRetainingCapacity();
         var inherits = false;
         for (service.operations) |operation| {
-            if (operation.security) |own| try c.collectSchemes(&used, own) else inherits = true;
+            if (operation.security) |own| try c.collectSchemes(own) else inherits = true;
         }
-        if (inherits) try c.collectSchemes(&used, service.security);
+        if (inherits) try c.collectSchemes(service.security);
+        std.mem.sort([]const u8, c.used_schemes.items, {}, stringLessThan);
 
-        // For each declared scheme name, whether an operation whose requirements name it is
-        // refused: true when the name is declared twice, since a requirement naming it is
-        // ambiguous, or when a scheme of that name is of a kind mock does not implement.
-        var schemes: std.StringHashMapUnmanaged(bool) = .empty;
-        defer schemes.deinit(c.gpa);
+        // On the first entry of each declared scheme name, whether an operation whose
+        // requirements name it is refused: true when the name is declared twice, since a
+        // requirement naming it is ambiguous, or when a scheme of that name is of a kind mock does
+        // not implement.
+        try sortNames(c.gpa, &c.schemes, service.security_schemes, "name");
+        const schemes = c.schemes.items;
+        var first: usize = 0;
+        while (first < schemes.len) {
+            var end = first + 1;
+            while (end < schemes.len and std.mem.eql(u8, schemes[end].name, schemes[first].name)) end += 1;
+            schemes[first].refused = end - first > 1;
+            for (schemes[first..end]) |entry| {
+                if (service.security_schemes[entry.index].kind == .other) schemes[first].refused = true;
+            }
+            first = end;
+        }
         for (service.security_schemes, 0..) |scheme, i| {
-            const entry = try schemes.getOrPut(c.gpa, scheme.name);
-            if (entry.found_existing) {
-                entry.value_ptr.* = true;
+            if (findName(schemes, scheme.name).?.index != i) {
                 try c.refuse(at, "/security_schemes/{d}/name", .{i}, .duplicate_scheme_name, scheme.name);
-            } else entry.value_ptr.* = false;
+            }
             switch (scheme.kind) {
                 .other => |kind| {
-                    entry.value_ptr.* = true;
-                    const reason: Refusal.Reason = if (used.contains(scheme.name))
-                        .unsupported_scheme_kind
-                    else
-                        .unsupported_scheme_kind_unused;
+                    const used = std.sort.binarySearch([]const u8, c.used_schemes.items, scheme.name, orderString) != null;
+                    const reason: Refusal.Reason = if (used) .unsupported_scheme_kind else .unsupported_scheme_kind_unused;
                     try c.refuse(at, "/security_schemes/{d}/kind/other", .{i}, reason, kind);
                 },
                 .api_key, .http_basic, .http_bearer, .oauth2, .openid_connect => {},
             }
         }
 
-        const defaults_refused = try c.checkRequirements(at, &schemes, service.security);
+        const defaults_refused = try c.checkRequirements(at, service.security);
 
-        // Each id's first operation, so that a repeat can refuse it as well.
-        var ids: std.StringHashMapUnmanaged(usize) = .empty;
-        defer ids.deinit(c.gpa);
+        try sortNames(c.gpa, &c.ids, service.operations, "id");
         for (service.operations, 0..) |*operation, o| {
             const op_at: Site = .{ .service = service, .s = at.s, .operation = operation, .o = o };
-            const first = try ids.getOrPut(c.gpa, operation.id);
-            if (first.found_existing) {
+            const first_use = findName(c.ids.items, operation.id).?.index;
+            if (first_use != o) {
                 // The record and fault rules name an operation by its id, so neither of the two
                 // could be told apart from the other.
-                refused[first.value_ptr.*] = true;
+                refused[first_use] = true;
                 refused[o] = true;
                 try c.refuse(op_at, "/id", .{}, .duplicate_operation_id, operation.id);
-            } else first.value_ptr.* = o;
+            }
 
             const requirements_refused = if (operation.security) |own|
-                try c.checkRequirements(op_at, &schemes, own)
+                try c.checkRequirements(op_at, own)
             else
                 defaults_refused;
             if (requirements_refused) refused[o] = true;
@@ -353,17 +517,12 @@ const Checker = struct {
     }
 
     /// Returns whether any requirement names a scheme that is not declared or is refused.
-    fn checkRequirements(
-        c: *Checker,
-        at: Site,
-        schemes: *const std.StringHashMapUnmanaged(bool),
-        requirements: []const model.Requirement,
-    ) Allocator.Error!bool {
+    fn checkRequirements(c: *Checker, at: Site, requirements: []const model.Requirement) Allocator.Error!bool {
         var refused = false;
         for (requirements, 0..) |requirement, k| {
             for (requirement, 0..) |use, u| {
-                if (schemes.get(use.scheme)) |scheme_refused| {
-                    if (scheme_refused) refused = true;
+                if (findName(c.schemes.items, use.scheme)) |scheme| {
+                    if (scheme.refused) refused = true;
                 } else {
                     refused = true;
                     try c.refuse(at, "/security/{d}/{d}/scheme", .{ k, u }, .unknown_scheme, use.scheme);
@@ -373,13 +532,9 @@ const Checker = struct {
         return refused;
     }
 
-    fn collectSchemes(
-        c: *Checker,
-        used: *std.StringHashMapUnmanaged(void),
-        requirements: []const model.Requirement,
-    ) Allocator.Error!void {
+    fn collectSchemes(c: *Checker, requirements: []const model.Requirement) Allocator.Error!void {
         for (requirements) |requirement| {
-            for (requirement) |use| try used.put(c.gpa, use.scheme, {});
+            for (requirement) |use| try c.used_schemes.append(c.gpa, use.scheme);
         }
     }
 
@@ -402,11 +557,11 @@ const Checker = struct {
         }
         for (operation.responses, 0..) |response, r| {
             for (response.headers, 0..) |header, h| {
-                if (try c.walk(at, header.schema, .{ .response_header = .{ r, h } })) refused = true;
+                if (try c.walk(at, header.schema, .{ .response_header = .{ .response = r, .header = h } })) refused = true;
             }
             for (response.content, 0..) |content, i| {
                 const schema = content.schema orelse continue;
-                if (try c.walk(at, schema, .{ .response_content = .{ r, i } })) refused = true;
+                if (try c.walk(at, schema, .{ .response_content = .{ .response = r, .content = i } })) refused = true;
             }
         }
         return refused;
@@ -417,8 +572,12 @@ const Checker = struct {
         try c.push(root, .{ .parent = null, .edge = .{ .root = from } });
         var refused = false;
         while (c.stack.pop()) |pending| {
+            // Marked visited when expanded, not when pushed: children are pushed last first, so
+            // they are expanded depth first in field order, and a schema reached by several paths
+            // is named by the first. A schema is expanded once, so the pushes are bounded by the
+            // edges of the graph.
+            if ((try c.visited.getOrPut(c.gpa, pending.schema)).found_existing) continue;
             if (try c.checkSchema(at, pending)) refused = true;
-            // Children are pushed last first, so that they are checked in field order.
             const schema = pending.schema;
             var i = schema.one_of.len;
             while (i > 0) : (i -= 1) try c.push(schema.one_of[i - 1], .{ .parent = pending.step, .edge = .{ .one_of = i - 1 } });
@@ -438,7 +597,7 @@ const Checker = struct {
     }
 
     fn push(c: *Checker, schema: *const model.Schema, step: Step) Allocator.Error!void {
-        if ((try c.visited.getOrPut(c.gpa, schema)).found_existing) return;
+        if (c.visited.contains(schema)) return;
         try c.trail.append(c.gpa, step);
         try c.stack.append(c.gpa, .{ .schema = schema, .step = c.trail.items.len - 1 });
     }
@@ -465,7 +624,7 @@ const Checker = struct {
     fn refuseKeyword(c: *Checker, at: Site, step: usize, built: *bool, keyword: []const u8) Allocator.Error!void {
         // Past the bound the pointer is not built at all, so a long chain of refused schemas
         // costs no more than counting.
-        if (!c.count(.unsupported_keyword)) return;
+        if (!c.admit(.unsupported_keyword)) return;
         if (!built.*) {
             try c.schemaPointer(at, step);
             built.* = true;
@@ -491,8 +650,8 @@ const Checker = struct {
                 .root => |root| switch (root) {
                     .parameter => |i| try out.print(c.gpa, "/parameters/{d}/schema", .{i}),
                     .request_content => |i| try out.print(c.gpa, "/request_body/content/{d}/schema", .{i}),
-                    .response_header => |rh| try out.print(c.gpa, "/responses/{d}/headers/{d}/schema", rh),
-                    .response_content => |rc| try out.print(c.gpa, "/responses/{d}/content/{d}/schema", rc),
+                    .response_header => |rh| try out.print(c.gpa, "/responses/{d}/headers/{d}/schema", .{ rh.response, rh.header }),
+                    .response_content => |rc| try out.print(c.gpa, "/responses/{d}/content/{d}/schema", .{ rc.response, rc.content }),
                 },
                 .items => try out.appendSlice(c.gpa, "/items"),
                 .property => |i| try out.print(c.gpa, "/properties/{d}/schema", .{i}),
@@ -513,43 +672,54 @@ const Checker = struct {
         reason: Refusal.Reason,
         name: []const u8,
     ) Allocator.Error!void {
-        if (!c.count(reason)) return;
+        if (!c.admit(reason)) return;
         c.pointer.clearRetainingCapacity();
-        if (at.operation == null)
+        if (at.service == null)
+            try c.pointer.print(c.gpa, suffix, args)
+        else if (at.operation == null)
             try c.pointer.print(c.gpa, "/services/{d}" ++ suffix, .{at.s} ++ args)
         else
             try c.pointer.print(c.gpa, "/services/{d}/operations/{d}" ++ suffix, .{ at.s, at.o } ++ args);
         try c.list(at, reason, name);
     }
 
-    /// Counts a line, and returns whether it may still be listed: false once a line has been
-    /// left out for the bound.
-    fn count(c: *Checker, reason: Refusal.Reason) bool {
-        if (reason != .unsupported_scheme_kind_unused) c.refusals += 1;
+    /// Notes a line, and returns whether it may still be listed: false once a line has been left
+    /// out for the bound.
+    fn admit(c: *Checker, reason: Refusal.Reason) bool {
+        if (reason != .unsupported_scheme_kind_unused) c.refused_any = true;
         if (c.unlisted == 0) return true;
-        c.unlisted += 1;
+        c.unlisted +|= 1;
         return false;
     }
 
-    /// Lists a line that `count` let through, with its pointer in `c.pointer`, or leaves it out
-    /// when its text would take the report past `text_max`. Every string is copied into the
-    /// arena, because the caller may free the model once the load returns.
+    /// Lists a line that `admit` let through, with its pointer in `c.pointer`, or leaves it out
+    /// when its record and text would take the report past `report_max`. Every string is copied,
+    /// because the caller may free the model once the load returns.
     fn list(c: *Checker, at: Site, reason: Refusal.Reason, name: []const u8) Allocator.Error!void {
-        const operation: ?[]const u8 = if (at.operation) |o| o.id else null;
+        const service: []const u8 = if (at.service) |s| s.name else "";
+        const operation: []const u8 = if (at.operation) |o| o.id else "";
         // Saturating, so that strings that alias one another cannot wrap the sum.
-        const text = at.service.name.len +| (if (operation) |id| id.len else 0) +| c.pointer.items.len +| name.len;
-        if (text > c.text_max - c.text) {
-            c.unlisted += 1;
+        const bytes = @sizeOf(Refusal) +| service.len +| operation.len +| c.pointer.items.len +| name.len;
+        if (bytes > c.report_max - c.listed_bytes) {
+            c.unlisted +|= 1;
             return;
         }
-        try c.report.append(c.arena, .{
-            .service = try c.arena.dupe(u8, at.service.name),
-            .operation = if (operation) |id| try c.arena.dupe(u8, id) else null,
-            .pointer = try c.arena.dupe(u8, c.pointer.items),
+        try c.lines.ensureUnusedCapacity(c.gpa, 1);
+        try c.text.ensureUnusedCapacity(c.gpa, bytes - @sizeOf(Refusal));
+        c.lines.appendAssumeCapacity(.{
+            .service = if (at.service != null) c.appendText(service) else null,
+            .operation = if (at.operation != null) c.appendText(operation) else null,
+            .pointer = c.appendText(c.pointer.items),
             .reason = reason,
-            .name = try c.arena.dupe(u8, name),
+            .name = c.appendText(name),
         });
-        c.text += text;
+        c.listed_bytes += bytes;
+    }
+
+    fn appendText(c: *Checker, bytes: []const u8) Span {
+        const start = c.text.items.len;
+        c.text.appendSliceAssumeCapacity(bytes);
+        return .{ .start = start, .len = bytes.len };
     }
 };
 
@@ -683,6 +853,52 @@ test "compile: a keyword outside the annotations is refused, by name and place" 
     }});
 }
 
+test "compile: the walk reaches a schema through every kind of child" {
+    // Each child is reached through one edge only, so a walk that skipped an edge would miss
+    // its line.
+    const schema: model.Schema = .{
+        .items = &.{ .other_keywords = &.{"prefixItems"} },
+        .properties = &.{.{ .name = "p", .schema = &.{ .other_keywords = &.{"propertyNames"} } }},
+        .additional_properties = .{ .schema = &.{ .other_keywords = &.{"contains"} } },
+        .all_of = &.{&.{ .other_keywords = &.{"if"} }},
+        .any_of = &.{&.{ .other_keywords = &.{"then"} }},
+        .one_of = &.{&.{ .other_keywords = &.{"else"} }},
+    };
+    const m: model.Model = .{ .services = &.{.{ .name = "s", .operations = &.{op("o", ok(&schema))} }} };
+    var loaded: Loaded = .init(&m, .{ .on_unsupported = .refuse_operation });
+    defer loaded.deinit();
+    const root = "/services/0/operations/0/responses/0/content/0/schema";
+    try loaded.expectRefusals(&.{
+        .{ .service = "s", .operation = "o", .pointer = root ++ "/items", .reason = .unsupported_keyword, .name = "prefixItems" },
+        .{ .service = "s", .operation = "o", .pointer = root ++ "/properties/0/schema", .reason = .unsupported_keyword, .name = "propertyNames" },
+        .{ .service = "s", .operation = "o", .pointer = root ++ "/additional_properties/schema", .reason = .unsupported_keyword, .name = "contains" },
+        .{ .service = "s", .operation = "o", .pointer = root ++ "/all_of/0", .reason = .unsupported_keyword, .name = "if" },
+        .{ .service = "s", .operation = "o", .pointer = root ++ "/any_of/0", .reason = .unsupported_keyword, .name = "then" },
+        .{ .service = "s", .operation = "o", .pointer = root ++ "/one_of/0", .reason = .unsupported_keyword, .name = "else" },
+    });
+    try loaded.expectRefused(&.{&.{true}});
+}
+
+test "compile: a schema reached by two paths is named by the first in field order" {
+    const by_properties: model.Schema = .{ .properties = &.{
+        .{ .name = "a", .schema = &refused_not },
+        .{ .name = "b", .schema = &refused_not },
+    } };
+    // `items` comes before `one_of` among `Schema`'s fields, though the walk pushes `one_of`
+    // first.
+    const by_items: model.Schema = .{ .items = &refused_not, .one_of = &.{&refused_not} };
+    const m: model.Model = .{ .services = &.{.{ .name = "s", .operations = &.{
+        op("properties", ok(&by_properties)),
+        op("items", ok(&by_items)),
+    } }} };
+    var loaded: Loaded = .init(&m, .{ .on_unsupported = .refuse_operation });
+    defer loaded.deinit();
+    try loaded.expectRefusals(&.{
+        .{ .service = "s", .operation = "properties", .pointer = "/services/0/operations/0/responses/0/content/0/schema/properties/0/schema", .reason = .unsupported_keyword, .name = "not" },
+        .{ .service = "s", .operation = "items", .pointer = "/services/0/operations/1/responses/0/content/0/schema/items", .reason = .unsupported_keyword, .name = "not" },
+    });
+}
+
 test "compile: annotations are accepted, and every other keyword is refused" {
     // Each accepted name would show up as an extra line if it were refused; each refused name
     // would be missing from the lines if it were accepted. The references stay refused because
@@ -737,11 +953,28 @@ test "compile: on_unsupported decides between failing the load and refusing what
     try per_op.expectRefusals(&.{line});
 }
 
+test "compile: the load decision is made from whether anything was refused, not from a count" {
+    // 256 refusals: a count of eight bits or fewer wraps to zero here and lets the load through.
+    // A 32-bit count can wrap the same way, from a model that is large but not absurd, since a
+    // shared schema is checked again for each operation that reaches it.
+    const nots: model.Schema = .{ .other_keywords = &([_][]const u8{"not"} ** 256) };
+    const m: model.Model = .{ .services = &.{.{ .name = "s", .operations = &.{op("o", ok(&nots))} }} };
+    var loaded: Loaded = .init(&m, .{});
+    defer loaded.deinit();
+    try loaded.expectModelRefused();
+    try testing.expectEqual(256, loaded.diag.report.len);
+}
+
 const self_items: model.Schema = .{ .items = &self_items, .other_keywords = &.{"not"} };
+// Cycles through `properties`, `additionalProperties` and `items` only, which the design allows:
+// each step consumes one level of the instance. A composition naming itself is a cycle the
+// design refuses, so no fixture pins it as accepted.
 const tree: model.Schema = .{
+    .items = &tree,
     .properties = &.{.{ .name = "child", .schema = &tree }},
     .additional_properties = .{ .schema = &tree },
-    .one_of = &.{ &tree, &refused_not },
+    .one_of = &.{ &plain, &refused_not },
+    .other_keywords = &.{"if"},
 };
 
 test "compile: a schema cycle is walked once, and each schema refused once" {
@@ -753,6 +986,7 @@ test "compile: a schema cycle is walked once, and each schema refused once" {
     defer loaded.deinit();
     try loaded.expectRefusals(&.{
         .{ .service = "s", .operation = "loop", .pointer = "/services/0/operations/0/responses/0/content/0/schema", .reason = .unsupported_keyword, .name = "not" },
+        .{ .service = "s", .operation = "tree", .pointer = "/services/0/operations/1/responses/0/content/0/schema", .reason = .unsupported_keyword, .name = "if" },
         .{ .service = "s", .operation = "tree", .pointer = "/services/0/operations/1/responses/0/content/0/schema/one_of/1", .reason = .unsupported_keyword, .name = "not" },
     });
     try loaded.expectRefused(&.{&.{ true, true }});
@@ -785,19 +1019,74 @@ test "compile: a requirement naming an undeclared scheme refuses the operations 
             op("inherits", ok(&plain)),
             .{ .id = "own", .method = .GET, .path = "/o", .responses = ok(&plain), .security = &.{
                 &.{.{ .scheme = "key" }},
-                &.{ .{ .scheme = "key" }, .{ .scheme = "missing" } },
+                &.{ .{ .scheme = "key" }, .{ .scheme = "absent" } },
             } },
             .{ .id = "none", .method = .GET, .path = "/n", .responses = ok(&plain), .security = &.{} },
             .{ .id = "declared", .method = .GET, .path = "/d", .responses = ok(&plain), .security = &.{&.{.{ .scheme = "key" }}} },
         },
     }} };
+    // "nope" sorts after the one declared name and "absent" before it, so a lookup that took the
+    // nearest declared name for the one asked would miss either.
     var loaded: Loaded = .init(&m, .{ .on_unsupported = .refuse_operation });
     defer loaded.deinit();
     try loaded.expectRefusals(&.{
         .{ .service = "s", .operation = null, .pointer = "/services/0/security/0/0/scheme", .reason = .unknown_scheme, .name = "nope" },
-        .{ .service = "s", .operation = "own", .pointer = "/services/0/operations/1/security/1/1/scheme", .reason = .unknown_scheme, .name = "missing" },
+        .{ .service = "s", .operation = "own", .pointer = "/services/0/operations/1/security/1/1/scheme", .reason = .unknown_scheme, .name = "absent" },
     });
     try loaded.expectRefused(&.{&.{ true, true, false, false }});
+}
+
+test "compile: an undeclared scheme in the service's requirements fails the load though no operation takes them" {
+    const m: model.Model = .{ .services = &.{.{
+        .name = "s",
+        .security = &.{&.{.{ .scheme = "nope" }}},
+        .operations = &.{
+            .{ .id = "open", .method = .GET, .path = "/o", .responses = ok(&plain), .security = &.{} },
+        },
+    }} };
+    const line: Refusal = .{ .service = "s", .operation = null, .pointer = "/services/0/security/0/0/scheme", .reason = .unknown_scheme, .name = "nope" };
+
+    var whole: Loaded = .init(&m, .{});
+    defer whole.deinit();
+    try whole.expectModelRefused();
+    try whole.expectRefusals(&.{line});
+
+    var per_op: Loaded = .init(&m, .{ .on_unsupported = .refuse_operation });
+    defer per_op.deinit();
+    try per_op.expectRefusals(&.{line});
+    try per_op.expectRefused(&.{&.{false}});
+}
+
+test "compile: operation ids and scheme names are each a service's own" {
+    // The same id in two services, at different indices: all are served.
+    const ids: model.Model = .{ .services = &.{
+        .{ .name = "a", .operations = &.{op("get", ok(&plain))} },
+        .{ .name = "b", .operations = &.{ op("list", ok(&plain)), op("get", ok(&plain)) } },
+    } };
+    var by_id: Loaded = .init(&ids, .{});
+    defer by_id.deinit();
+    try by_id.expectRefusals(&.{});
+    try by_id.expectRefused(&.{ &.{false}, &.{ false, false } });
+
+    // A scheme declared only by service a, named by service b: undeclared in b.
+    const schemes: model.Model = .{ .services = &.{
+        .{
+            .name = "a",
+            .security_schemes = &.{.{ .name = "key", .kind = .{ .api_key = .{ .in = .header, .name = "X-Key" } } }},
+            .operations = &.{op("x", ok(&plain))},
+        },
+        .{ .name = "b", .operations = &.{
+            .{ .id = "y", .method = .GET, .path = "/y", .responses = ok(&plain), .security = &.{&.{.{ .scheme = "key" }}} },
+        } },
+    } };
+    const line: Refusal = .{ .service = "b", .operation = "y", .pointer = "/services/1/operations/0/security/0/0/scheme", .reason = .unknown_scheme, .name = "key" };
+    var whole: Loaded = .init(&schemes, .{});
+    defer whole.deinit();
+    try whole.expectModelRefused();
+    try whole.expectRefusals(&.{line});
+    var per_op: Loaded = .init(&schemes, .{ .on_unsupported = .refuse_operation });
+    defer per_op.deinit();
+    try per_op.expectRefused(&.{ &.{false}, &.{true} });
 }
 
 test "compile: a scheme of a kind mock does not implement refuses every operation that names it" {
@@ -883,14 +1172,18 @@ test "compile: a scheme of a kind mock does not implement that no operation requ
 }
 
 test "compile: a name used twice" {
-    // Operation ids: both operations sharing the id are refused, the third is served.
+    // Operation ids: every operation sharing the id is refused, and each repeat is reported where
+    // it is; the operation between them is served.
     const ids: model.Model = .{ .services = &.{.{ .name = "s", .operations = &.{
-        op("get", ok(&plain)), op("list", ok(&plain)), op("get", ok(&plain)),
+        op("get", ok(&plain)), op("list", ok(&plain)), op("get", ok(&plain)), op("get", ok(&plain)),
     } }} };
     var by_id: Loaded = .init(&ids, .{ .on_unsupported = .refuse_operation });
     defer by_id.deinit();
-    try by_id.expectRefusals(&.{.{ .service = "s", .operation = "get", .pointer = "/services/0/operations/2/id", .reason = .duplicate_operation_id, .name = "get" }});
-    try by_id.expectRefused(&.{&.{ true, false, true }});
+    try by_id.expectRefusals(&.{
+        .{ .service = "s", .operation = "get", .pointer = "/services/0/operations/2/id", .reason = .duplicate_operation_id, .name = "get" },
+        .{ .service = "s", .operation = "get", .pointer = "/services/0/operations/3/id", .reason = .duplicate_operation_id, .name = "get" },
+    });
+    try by_id.expectRefused(&.{&.{ true, false, true, true }});
 
     // Scheme names: a requirement naming the repeated name is ambiguous.
     const schemes: model.Model = .{ .services = &.{.{
@@ -938,6 +1231,47 @@ test "compile: a name used twice" {
     }
 }
 
+test "compile: a client whose alg names no key the provider holds fails the load under either setting" {
+    const refusing: model.Model = .{
+        .services = &.{.{ .name = "s", .operations = &.{op("bad", ok(&refused_not))} }},
+        .identity = .{
+            .keys = &.{ .{ .alg = .ES256 }, .{ .alg = .Ed25519 } },
+            .clients = &.{
+                // A null alg takes the first key.
+                .{ .id = "first", .secret = "x" },
+                .{ .id = "es", .secret = "x", .alg = .ES256 },
+                .{ .id = "hs", .secret = "x", .alg = .HS256 },
+                // The older name of an Ed25519 key is another alg: a token signed under one
+                // name does not verify under the other.
+                .{ .id = "eddsa", .secret = "x", .alg = .EdDSA },
+            },
+        },
+    };
+    for ([_]Options{ .{ .on_unsupported = .refuse_model }, .{ .on_unsupported = .refuse_operation } }) |options| {
+        var loaded: Loaded = .init(&refusing, options);
+        defer loaded.deinit();
+        try loaded.expectModelRefused();
+        // After every service's lines.
+        try loaded.expectRefusals(&.{
+            .{ .service = "s", .operation = "bad", .pointer = "/services/0/operations/0/responses/0/content/0/schema", .reason = .unsupported_keyword, .name = "not" },
+            .{ .service = null, .operation = null, .pointer = "/identity/clients/2/alg", .reason = .no_key_for_alg, .name = "HS256" },
+            .{ .service = null, .operation = null, .pointer = "/identity/clients/3/alg", .reason = .no_key_for_alg, .name = "EdDSA" },
+        });
+    }
+
+    const held: model.Model = .{
+        .services = &.{.{ .name = "s", .operations = &.{op("o", ok(&plain))} }},
+        .identity = .{
+            .keys = &.{ .{ .alg = .HS256 }, .{ .alg = .EdDSA } },
+            .clients = &.{ .{ .id = "first", .secret = "x" }, .{ .id = "eddsa", .secret = "x", .alg = .EdDSA } },
+        },
+    };
+    var loaded: Loaded = .init(&held, .{});
+    defer loaded.deinit();
+    try loaded.expectRefusals(&.{});
+    try loaded.expectRefused(&.{&.{false}});
+}
+
 test "compile: the report outlives the model, and the next load replaces it" {
     const gpa = testing.allocator;
     const service_name = try gpa.dupe(u8, "pets");
@@ -964,7 +1298,7 @@ test "compile: the report outlives the model, and the next load replaces it" {
     @memset(op_id, 'x');
     @memset(keyword, 'x');
     try testing.expectEqual(1, diag.report.len);
-    try testing.expectEqualStrings("pets", diag.report[0].service);
+    try testing.expectEqualStrings("pets", diag.report[0].service.?);
     try testing.expectEqualStrings("getPet", diag.report[0].operation.?);
     try testing.expectEqualStrings("not", diag.report[0].name);
 
@@ -972,6 +1306,42 @@ test "compile: the report outlives the model, and the next load replaces it" {
     var compiled = try compile(gpa, &clean, .{}, &diag);
     compiled.deinit(gpa);
     try testing.expectEqual(0, diag.report.len);
+}
+
+test "compile: after error.OutOfMemory, a Diagnostics that held a report holds an empty one" {
+    const m: model.Model = .{ .services = &.{.{ .name = "s", .operations = &.{op("o", ok(&refused_not))} }} };
+    // Each allocation of the load in turn fails, until a load succeeds in allocating at all.
+    var fail_index: usize = 0;
+    while (true) : (fail_index += 1) {
+        var diag: Diagnostics = .{};
+        defer diag.deinit(testing.allocator);
+        try testing.expectError(error.ModelRefused, compile(testing.allocator, &m, .{}, &diag));
+        try testing.expectEqual(1, diag.report.len);
+
+        var failing: std.testing.FailingAllocator = .init(testing.allocator, .{ .fail_index = fail_index });
+        _ = compile(failing.allocator(), &m, .{}, &diag) catch |err| switch (err) {
+            error.ModelRefused => break,
+            error.OutOfMemory => {
+                try testing.expectEqual(0, diag.report.len);
+                try testing.expectEqual(0, diag.unlisted);
+                continue;
+            },
+        };
+        return error.TestUnexpectedResult;
+    }
+    try testing.expect(fail_index > 1);
+}
+
+test "compile: with no Diagnostics, nothing is kept and nothing leaks" {
+    const m: model.Model = .{ .services = &.{.{
+        .name = "s",
+        .security_schemes = &.{.{ .name = "mtls", .kind = .{ .other = "mutualTLS" } }},
+        .operations = &.{ op("bad", ok(&refused_not)), op("good", ok(&plain)) },
+    }} };
+    try testing.expectError(error.ModelRefused, compile(testing.allocator, &m, .{}, null));
+    var compiled = try compile(testing.allocator, &m, .{ .on_unsupported = .refuse_operation }, null);
+    defer compiled.deinit(testing.allocator);
+    try testing.expectEqualDeep(@as([]const []const bool, &.{&.{ true, false }}), compiled.refused);
 }
 
 test "Refusal.format: one line, with names written as JSON strings" {
@@ -1003,17 +1373,37 @@ test "Refusal.format: one line, with names written as JSON strings" {
         .reason = .unsupported_scheme_kind_unused,
         .name = "mutualTLS",
     }});
+    // Each reason's own words: a line printed with another reason's would send its reader to the
+    // wrong fault.
+    try testing.expectFmt(
+        \\service "s", operation "o", /services/0/operations/0/security/0/0/scheme: no security scheme named "key"
+    , "{f}", .{Refusal{ .service = "s", .operation = "o", .pointer = "/services/0/operations/0/security/0/0/scheme", .reason = .unknown_scheme, .name = "key" }});
+    try testing.expectFmt(
+        \\service "s", /services/0/security_schemes/1/name: security scheme name used twice "auth"
+    , "{f}", .{Refusal{ .service = "s", .operation = null, .pointer = "/services/0/security_schemes/1/name", .reason = .duplicate_scheme_name, .name = "auth" }});
+    try testing.expectFmt(
+        \\service "pets", /services/1/name: service name used twice "pets"
+    , "{f}", .{Refusal{ .service = "pets", .operation = null, .pointer = "/services/1/name", .reason = .duplicate_service_name, .name = "pets" }});
+    // A line in no service starts at its pointer.
+    try testing.expectFmt(
+        \\/identity/clients/2/alg: no key of the identity provider has alg "HS256"
+    , "{f}", .{Refusal{ .service = null, .operation = null, .pointer = "/identity/clients/2/alg", .reason = .no_key_for_alg, .name = "HS256" }});
+    // Invalid UTF-8 is printed as U+FFFD inside the string, never as an array of bytes; valid
+    // multi-byte sequences are kept. Each byte outside a valid sequence is one U+FFFD: a lead
+    // byte with no continuation, and each byte of an encoded surrogate.
+    try testing.expectFmt("service \"s\u{FFFD}\", operation \"\u{FFFD}\u{FFFD}\", /services/0/operations/0/id: operation id used twice \"\u{FFFD}\u{FFFD}\u{FFFD}é\"", "{f}", .{Refusal{ .service = "s\xff", .operation = "\xc3\xe9", .pointer = "/services/0/operations/0/id", .reason = .duplicate_operation_id, .name = "\xed\xa0\x80é" }});
 }
 
 test "Diagnostics.format: one line each, then the count of lines past the bound" {
     const line: Refusal = .{ .service = "s", .operation = "o", .pointer = "/services/0/operations/0/id", .reason = .duplicate_operation_id, .name = "o" };
-    // Without the last line a reader would take the listed lines for the whole report.
+    // Without the last line a reader would take the listed lines for the whole report. The bound
+    // printed is the one the report was built with.
     try testing.expectFmt(
         \\service "s", operation "o", /services/0/operations/0/id: operation id used twice "o"
         \\service "s", operation "o", /services/0/operations/0/id: operation id used twice "o"
-        \\3 more not listed: the report keeps at most 1048576 bytes of text
+        \\3 more not listed: the report keeps at most 4096 bytes
         \\
-    , "{f}", .{Diagnostics{ .report = &.{ line, line }, .unlisted = 3 }});
+    , "{f}", .{Diagnostics{ .report = &.{ line, line }, .unlisted = 3, .report_max = 4096 }});
     // And with nothing past the bound, no count line.
     try testing.expectFmt(
         \\service "s", operation "o", /services/0/operations/0/id: operation id used twice "o"
@@ -1024,11 +1414,11 @@ test "Diagnostics.format: one line each, then the count of lines past the bound"
 
 test "compile: the report lists lines until the next would pass its bound, and counts the rest" {
     const gpa = testing.allocator;
-    // A line's text here is "s", the operation id, the pointer and the keyword.
-    const line_text = 1 + 1 + "/services/0/operations/0/responses/0/content/0/schema".len;
+    // A line's memory here is its record, "s", the operation id, the pointer and the keyword.
+    const line_bytes = @sizeOf(Refusal) + 1 + 1 + "/services/0/operations/0/responses/0/content/0/schema".len;
     // One byte longer than the keyword that, with a second line refusing "not", fills the
     // report exactly.
-    const big = try gpa.alloc(u8, default_report_text_max - 2 * line_text - "not".len + 1);
+    const big = try gpa.alloc(u8, default_report_max - 2 * line_bytes - "not".len + 1);
     defer gpa.free(big);
     @memset(big, 'k');
 
@@ -1079,11 +1469,74 @@ test "compile: the report lists lines until the next would pass its bound, and c
     try testing.checkAllAllocationFailures(gpa, compileWithReport, .{ &m, Options{ .on_unsupported = .refuse_operation } });
 }
 
+/// Counts the bytes allocated through it and not yet freed.
+const LiveBytes = struct {
+    child: Allocator,
+    bytes: usize = 0,
+
+    fn allocator(l: *LiveBytes) Allocator {
+        return .{ .ptr = l, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+    }
+
+    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
+        const l: *LiveBytes = @ptrCast(@alignCast(ctx));
+        const memory = l.child.rawAlloc(len, alignment, ret_addr) orelse return null;
+        l.bytes += len;
+        return memory;
+    }
+
+    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
+        const l: *LiveBytes = @ptrCast(@alignCast(ctx));
+        if (!l.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
+        l.bytes = l.bytes - memory.len + new_len;
+        return true;
+    }
+
+    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
+        const l: *LiveBytes = @ptrCast(@alignCast(ctx));
+        const moved = l.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
+        l.bytes = l.bytes - memory.len + new_len;
+        return moved;
+    }
+
+    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+        const l: *LiveBytes = @ptrCast(@alignCast(ctx));
+        l.child.rawFree(memory, alignment, ret_addr);
+        l.bytes -= memory.len;
+    }
+};
+
+test "compile: the report's memory, records and text, stays within its bound, and nothing else is kept" {
+    // 20,000 lines of short text: within the bound counting text alone, more than twice past it
+    // counting each line's record as well.
+    const keywords = try testing.allocator.alloc([]const u8, 20_000);
+    defer testing.allocator.free(keywords);
+    @memset(keywords, "not");
+    const schema: model.Schema = .{ .other_keywords = keywords };
+    const content = [_]model.MediaContent{.{ .media_type = "application/json", .schema = &schema }};
+    const responses = [_]model.Response{.{ .status = .{ .code = 200 }, .content = &content }};
+    const operations = [_]model.Operation{op("o", &responses)};
+    const services = [_]model.Service{.{ .name = "s", .operations = &operations }};
+    const m: model.Model = .{ .services = &services };
+
+    var live: LiveBytes = .{ .child = testing.allocator };
+    var diag: Diagnostics = .{};
+    defer diag.deinit(live.allocator());
+    try testing.expectError(error.ModelRefused, compile(live.allocator(), &m, .{}, &diag));
+
+    const line_bytes = @sizeOf(Refusal) + "s".len + "o".len + "/services/0/operations/0/responses/0/content/0/schema".len + "not".len;
+    try testing.expectEqual(diag.report_max / line_bytes, diag.report.len);
+    try testing.expectEqual(keywords.len - diag.report.len, diag.unlisted);
+    // Once the load returns, all it holds is the report: no buffer left behind by its growth.
+    try testing.expectEqual(diag.report.len * line_bytes, live.bytes);
+    try testing.expect(live.bytes <= diag.report_max);
+}
+
 test "compile: the bound on the report never changes the load's outcome" {
     const gpa = testing.allocator;
-    // A line that refuses nothing and fills the report exactly: "s", no operation, the pointer
-    // and the kind.
-    const kind = try gpa.alloc(u8, default_report_text_max - 1 - "/services/0/security_schemes/0/kind/other".len);
+    // A line that refuses nothing and fills the report exactly: its record, "s", no operation,
+    // the pointer and the kind.
+    const kind = try gpa.alloc(u8, default_report_max - @sizeOf(Refusal) - 1 - "/services/0/security_schemes/0/kind/other".len);
     defer gpa.free(kind);
     @memset(kind, 'k');
     const schemes = [_]model.SecurityScheme{
@@ -1126,24 +1579,43 @@ fn compileWithReport(gpa: Allocator, m: *const model.Model, options: Options) !v
     compiled.deinit(gpa);
 }
 
+fn compileWithoutReport(gpa: Allocator, m: *const model.Model, options: Options) !void {
+    var compiled = compile(gpa, m, options, null) catch |err| switch (err) {
+        error.ModelRefused => return,
+        error.OutOfMemory => |e| return e,
+    };
+    compiled.deinit(gpa);
+}
+
 test "compile: no leak or double free when any allocation fails" {
-    const m: model.Model = .{ .services = &.{
-        .{
-            .name = "s",
-            .security_schemes = &.{
-                .{ .name = "mtls", .kind = .{ .other = "mutualTLS" } },
-                .{ .name = "digest", .kind = .{ .other = "http digest" } },
+    const m: model.Model = .{
+        .services = &.{
+            .{
+                .name = "s",
+                .security_schemes = &.{
+                    .{ .name = "mtls", .kind = .{ .other = "mutualTLS" } },
+                    .{ .name = "digest", .kind = .{ .other = "http digest" } },
+                },
+                .security = &.{&.{.{ .scheme = "nope" }}},
+                .operations = &.{
+                    op("a", ok(&tree)),
+                    op("b", ok(&plain)),
+                    op("a", ok(&self_items)),
+                    .{ .id = "m", .method = .GET, .path = "/m", .responses = ok(&plain), .security = &.{&.{.{ .scheme = "mtls" }}} },
+                },
             },
-            .security = &.{&.{.{ .scheme = "nope" }}},
-            .operations = &.{
-                op("a", ok(&tree)),
-                op("b", ok(&plain)),
-                op("a", ok(&self_items)),
-                .{ .id = "m", .method = .GET, .path = "/m", .responses = ok(&plain), .security = &.{&.{.{ .scheme = "mtls" }}} },
-            },
+            .{ .name = "t", .operations = &.{op("c", ok(&refused_not))} },
         },
-        .{ .name = "t", .operations = &.{op("c", ok(&refused_not))} },
-    } };
-    try testing.checkAllAllocationFailures(testing.allocator, compileWithReport, .{ &m, Options{ .on_unsupported = .refuse_operation } });
-    try testing.checkAllAllocationFailures(testing.allocator, compileWithReport, .{ &m, Options{ .on_unsupported = .refuse_model } });
+    };
+    // Apart, because a refused client refuses the whole model, and the sweep above must also
+    // reach a load that succeeds.
+    const identity: model.Model = .{
+        .services = &.{.{ .name = "s", .operations = &.{op("o", ok(&plain))} }},
+        .identity = .{ .clients = &.{ .{ .id = "c", .secret = "x", .alg = .HS256 }, .{ .id = "d", .secret = "x", .alg = .EdDSA } } },
+    };
+    inline for (.{ compileWithReport, compileWithoutReport }) |load| {
+        try testing.checkAllAllocationFailures(testing.allocator, load, .{ &m, Options{ .on_unsupported = .refuse_operation } });
+        try testing.checkAllAllocationFailures(testing.allocator, load, .{ &m, Options{ .on_unsupported = .refuse_model } });
+        try testing.checkAllAllocationFailures(testing.allocator, load, .{ &identity, Options{} });
+    }
 }

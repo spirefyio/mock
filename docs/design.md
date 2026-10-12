@@ -260,7 +260,9 @@ one line for every refusal, and one for each unsupported scheme that no operatio
 each naming where and what. Where is the service, the operation, and a JSON pointer (RFC 6901) from
 the model's root through the model types' field names and slice indices, such as
 `/services/0/operations/2/parameters/0/schema/items`; a schema reached by more than one path is
-named by the first path the check took. What is the keyword, parameter style, media type or scheme.
+named by the first in field order, since the check goes depth first through each schema's children
+in the order of `Schema`'s fields. What is the keyword, parameter style, media type, scheme or
+`alg`.
 
 What happens to a refusal is set by `Options.on_unsupported`:
 
@@ -293,9 +295,17 @@ scheme, so it cannot make an answer wrong. The line says so twice over: its reas
 `.unsupported_scheme_kind_unused`, and its printed form ends `named by no requirement, refuses
 nothing`.
 
-**The report is bounded.** It keeps at most 1 MiB of text (3, bounds); past that, lines are
-counted, not listed. The count is in `Diagnostics.unlisted`, and the printed report ends with it.
-The bound changes what is listed, never the load's outcome.
+**Identity clients.** A client whose `alg` names no key the provider holds fails the load under
+either setting, like a service name used twice: clients are the test's own configuration, not part
+of an API it imports, so there is nothing to serve around one that is wrong. Its line names no
+service and no operation; its pointer is `/identity/clients/<i>/alg`, and it comes after every
+service's lines. A client whose `alg` is null takes the provider's first key and is not checked
+here.
+
+**The report is bounded.** It keeps at most 1 MiB of memory, each line's text and its record (3,
+bounds); past that, lines are counted, not listed. The count is in `Diagnostics.unlisted`, and the
+printed report ends with it, with the bound. The bound changes what is listed, never the load's
+outcome.
 
 **Swapping.** `swapModel(new)` compiles the new model first. If it is refused, the old model keeps
 serving and the call returns the error with its report. If it compiles, one pointer is replaced
@@ -523,7 +533,7 @@ Every limit has a default, can be set in `Options.limits`, and fails visibly.
 | Fault rules / one fault's body | 256 / 1 MiB | `faults.add` returns `error.TooManyRules` or `error.FaultTooLarge`. |
 | Generation: depth / nodes / one string / one response / work | 8 / 10,000 / 4 KiB / 1 MiB / 1,000,000 steps | See 4.3. A schema whose minimum (`minItems`, `minLength`, required recursion) cannot fit is refused at load; one that overruns at run time gets 500. Nothing is clamped below what the schema requires. |
 | Compiled model | 64 MiB | The load is refused. |
-| Load report text (the service names, operation ids, pointers and names its lines hold) | 1 MiB | The lines are listed in the order the checks meet them until the next would pass the bound; it and every line after it are counted, not listed. `Diagnostics.unlisted` holds the count, and the printed report ends with it. The load's outcome is the one it would have without the bound. This also caps what a long chain of refused schemas, each with a longer pointer, can make the report hold. |
+| Load report memory: each line's text and its record | 1 MiB | The lines are listed in the order the checks meet them until the next would pass the bound; it and every line after it are counted, not listed. `Diagnostics.unlisted` holds the count, and the printed report ends with it. The load's outcome is the one it would have without the bound. This also caps what a long chain of refused schemas, each with a longer pointer, can make the report hold. |
 
 ### The seed
 

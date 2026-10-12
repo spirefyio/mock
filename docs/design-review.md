@@ -306,3 +306,14 @@ Pass 8's items:
 **BALLAST:** the pass judged all four new or rewritten plants armor. It noted that the range plant's
 narrative was wrong while the read check stays in place, since `now()` would then return the error
 rather than the out-of-range time; the plant now says the move succeeds.
+
+## Pass 10
+
+- **Reviewed:** the fix delta `a5a33fe..f3b5f2b` (pass 9's fixes), read-only, with pass 9's
+  findings and their dispositions.
+- **Model:** `gpt-6.1-sol`, reasoning effort `max`.
+- **Verdict:** **ACCEPT**. F56, F57 and F58 are closed, and so are the two notes. The pass checked
+  each of the seven named fix commits with `git show` and found that each adds its own pass
+  record. It judged both new plant cases armor and found no new defect.
+- **The review loop is closed:** this pass asked for no change. This record is the only commit after
+  it, and it changes no design text.

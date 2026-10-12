@@ -217,3 +217,20 @@ Pass 4's items:
 | F48 | LOW | "Frees the model it compiled" put compiling before the lock, while the bullet above said all work is done with the lock held | CONFIRMED-BY-READING: the two sentences disagree, and section 2 ("compiles the new model first") did not say where the lock is taken | `swapModel` compiles before taking the lock, and the held-lock rule names that exception (3). |
 
 **BALLAST:** the pass named nothing new. It judged the watchdog requirement useful armor.
+
+## Pass 6
+
+- **Reviewed:** the fix delta `6e7b01d..4baee22` (pass 5's fixes), read-only, with pass 5's
+  findings and their dispositions.
+- **Model:** `gpt-6.1-sol`, reasoning effort `max`.
+- **Verdict:** **ACCEPT WITH CHANGES**. The previous findings are closed. The pass asked for one
+  correction, to a blanket guarantee about cancelled task results.
+- **Fixed in:** the commit that follows this record, which gets its own pass.
+
+Pass 5's items: the rest of F45, the rest of F46, and F48 are all closed.
+
+| # | Sev. | Finding (short) | Disposition and evidence | Change |
+|---|---|---|---|---|
+| F49 | LOW | "Under `.blocked`, no `Io` call returns `error.Canceled`" is too broad: a cancelled child task's result can still be `error.Canceled` | CONFIRMED-BY-READING: `Future.cancel` returns the task's `Result` (`lib/std/Io.zig:1191-1195`), and protection covers only the calling task's cancelation points | The sentence names the calling task's cancelation points. `stop` consumes the expected `error.Canceled` from its accept tasks and the sweeper, then goes on with the shutdown (3). |
+
+**BALLAST:** the pass named nothing new.

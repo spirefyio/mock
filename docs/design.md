@@ -438,9 +438,13 @@ closed and possibly reused by the OS.
   `error.Canceled`. Shutting a socket down is itself cancelable (`ShutdownError`,
   `lib/std/Io/net.zig:982-988`), and so is taking a lock. Each therefore runs its whole body with
   the calling task's cancel protection set to `.blocked` (`swapCancelProtection`,
-  `lib/std/Io.zig:1342`) and restores the previous state on return. Under `.blocked`, no `Io` call
-  returns `error.Canceled` (`CancelProtection`, `:1322`). Cancelling the mock's own tasks is
-  unaffected, because protection belongs to the task that calls `stop`.
+  `lib/std/Io.zig:1342`) and restores the previous state on return. Under `.blocked`, no cancelation
+  point in the calling task returns `error.Canceled` (`CancelProtection`, `:1322`). Cancelling the
+  mock's own tasks is unaffected, because protection belongs to the task that calls `stop`. A
+  cancelled task's own result can still be `error.Canceled`, because `Future.cancel` returns the
+  task's result (`:1191`). `stop` expects that result from the accept tasks and the sweeper and
+  consumes it. It never treats it as unreachable, and it goes on to shut the sockets down and
+  cancel the connection group.
 - `start` and `swapModel` take the lock with `lock` (`:1602`), which can return `error.Canceled`
   while another call holds the lock. Each then returns `error.Canceled`, a member of `StartError`
   and `SwapError`, with nothing changed. A cancelled `start` has bound nothing, because `start`

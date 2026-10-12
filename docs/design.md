@@ -432,13 +432,22 @@ closed and possibly reused by the OS.
   thread waits for the first, then returns. No task of the mock takes that lock, so `stop` can
   await tasks while holding it. The lock is not recursive (`Io.Mutex.lock`, `lib/std/Io.zig:1602`),
   so each public call takes it once and does its work through internal functions that expect it
-  held; `deinit` runs the stop steps that way, never by calling `stop`.
-- Taking the lock can be cancelled. `stop` and `deinit` return nothing and must finish, so they
-  take it with `lockUncancelable` (`lib/std/Io.zig:1623`). `start` and `swapModel` take it with
-  `lock` (`:1602`), which can return `error.Canceled` while another call holds the lock. Each then
-  returns `error.Canceled`, a member of `StartError` and `SwapError`, with nothing changed. A
-  cancelled `start` has bound nothing. A cancelled `swapModel` frees the model it compiled, and the
-  old model keeps serving. The lock is released only by a call that took it.
+  held (the one exception, `swapModel`'s compiling, is below). `deinit` runs the stop steps that
+  way, never by calling `stop`.
+- `stop` and `deinit` return nothing and must finish, so no step of theirs may return early on
+  `error.Canceled`. Shutting a socket down is itself cancelable (`ShutdownError`,
+  `lib/std/Io/net.zig:982-988`), and so is taking a lock. Each therefore runs its whole body with
+  the calling task's cancel protection set to `.blocked` (`swapCancelProtection`,
+  `lib/std/Io.zig:1342`) and restores the previous state on return. Under `.blocked`, no `Io` call
+  returns `error.Canceled` (`CancelProtection`, `:1322`). Cancelling the mock's own tasks is
+  unaffected, because protection belongs to the task that calls `stop`.
+- `start` and `swapModel` take the lock with `lock` (`:1602`), which can return `error.Canceled`
+  while another call holds the lock. Each then returns `error.Canceled`, a member of `StartError`
+  and `SwapError`, with nothing changed. A cancelled `start` has bound nothing, because `start`
+  takes the lock before it binds. `swapModel` compiles its candidate BEFORE it takes the lock.
+  Compiling touches only the private candidate and the caller's model, so it is the one piece of
+  public-call work done without the lock held. A cancelled `swapModel` therefore frees the model it
+  compiled, and the old model keeps serving. The lock is released only by a call that took it.
 - `deinit` is the last call on a mock. The caller must own the mock exclusively by then, with no
   other thread inside or waiting on any of its methods, because `deinit` frees the lock with
   everything else.
@@ -454,7 +463,7 @@ Every limit has a default, can be set in `Options.limits`, and fails visibly.
 | Open connections per listener | 64 | The connection is accepted, answered 503 with a problem document and `Connection: close`, and recorded as refused. |
 | Request head | 16 KiB | 431 (RFC 6585 §5), then close. |
 | Request body | 1 MiB | 413, decided from `Content-Length` before any body is read, or as soon as a chunked body passes the limit; then close. |
-| JSON nesting depth in a request | 64 | 413, answered as 4.4 says: with the operation's declared 413 if it has one, otherwise with a problem document of type `request-too-complex`. Either way the record keeps the reason, so it stays distinct from a schema failure. |
+| JSON nesting depth in a request | 64 | 413, with the error response 4.4 chooses, `Options.validation_errors` included. The record keeps the reason `request-too-complex` whichever body is sent, so the refusal stays distinct from a schema failure. |
 | Validation work per request | 1,000,000 steps | As above. |
 | Idle connection / blocked write | 30 s / 30 s | Shut down by the sweeper, and recorded. |
 | Record entries | 10,000 | Later requests are still answered and **counted**, but not stored. Every query except `stats()` then returns `error.RecordOverflow` until `clear()`. A truncated record cannot be read by accident. |
@@ -1112,7 +1121,8 @@ entry point), not inside a helper, except where a row says why it cannot be.
 | The connection bound not enforced | Hold the bound's number of connections open, each confirmed accepted by its `pending` record entry; one more must get 503. |
 | `stop` waits on a client that never reads | On a deterministic test `Io` whose write blocks by construction, a client that never reads and a hook that signals the response write is blocked; only then is `stop` called, and it must return within the test's time limit. The same test on a real socket, with a body several times the two sockets' buffer sizes as the system reports them (and `limits` raised to allow it), is a smoke test only: it cannot prove the write had blocked. |
 | `deinit` takes the lifecycle lock again through `stop` | A started mock passed to `deinit` without a `stop` first must return within the test's time limit. The limit is enforced by a watchdog outside the call, never by the blocked call itself. |
-| A cancelled lock acquisition treated as taken | A `stop` holds the lifecycle lock, blocked on a test hook, and a `swapModel` waiting for the lock is cancelled. The `swapModel` must return `error.Canceled`, the old model must still serve, and the lock must stay held until the `stop` returns. A `stop` whose task is cancelled while it waits for the lock must still finish. |
+| A cancelled lock acquisition treated as taken | A `stop` holds the lifecycle lock, blocked on a test hook, and a `swapModel` waiting for the lock is cancelled. The `swapModel` must return `error.Canceled`, and the old model must still serve. A second lifecycle call made meanwhile must stay blocked until the `stop` returns, which shows the lock was never released by the cancelled call. The hook is released independently of the cancelled call. |
+| Cleanup that stops at a cancellation | Cancel the task that calls `stop` on a running mock with open connections, both while it waits for the lock and while it shuts sockets down. `stop` must still return with every socket in the live-connection table shut down and every task awaited. The plant removes the cancel protection, and the test then sees a socket left open or a task left running. |
 | A value is sent without the final validation | A unit test that hands the send boundary a value its schema forbids must get 500. The plant removes that check; the test then sees a 200. |
 | Equality by source text (`[1, 1.0]` passes `uniqueItems`) | The JSON-Schema-Test-Suite `uniqueItems` cases. |
 

@@ -192,3 +192,28 @@ Pass 3's items:
 
 **BALLAST:** the pass named nothing new. It found the added `deinit` plant to be armor, provided
 the time limit is enforced outside the blocked call. Section 8 now says so.
+
+## Pass 5
+
+- **Reviewed:** the fix delta `5afe804..6e7b01d` (pass 4's fixes), read-only, with pass 4's
+  findings and their dispositions.
+- **Model:** `gpt-6.1-sol`, reasoning effort `max`.
+- **Verdict:** **ACCEPT WITH CHANGES**. The design still had to:
+  - complete cancellation handling;
+  - settle when the swap candidate is compiled;
+  - keep every case of 4.4's response choice.
+- **Fixed in:** the commit that follows this record, which gets its own pass.
+
+Pass 4's items:
+- F47 is closed.
+- F45 is closed in part. Taking the lock was specified, but a cancellation already pending could
+  still cut cleanup short.
+- F46 is closed in part. The Bounds row summarised only part of 4.4's rule.
+
+| # | Sev. | Finding (short) | Disposition and evidence | Change |
+|---|---|---|---|---|
+| F45 (rest) | MED | Taking the lock uncancelably still leaves a pending cancellation able to stop cleanup at a cancelable step | CONFIRMED-BY-READING: `ShutdownError` includes `Cancelable` (`lib/std/Io/net.zig:982-988`), and the threaded shutdown checks for cancellation (`lib/std/Io/Threaded.zig:13235` onward). `CancelProtection` and `swapCancelProtection` (`lib/std/Io.zig:1322`, `:1342`) block it for a region. | `stop` and `deinit` run with cancel protection `.blocked`. A plant cancels a `stop` during cleanup (3, 8). |
+| F46 (rest) | LOW | The Bounds row named two of 4.4's choices and left out `4XX`, `default` and `.problem_document` | CONFIRMED-BY-READING | The row now defers to 4.4 entirely (3). |
+| F48 | LOW | "Frees the model it compiled" put compiling before the lock, while the bullet above said all work is done with the lock held | CONFIRMED-BY-READING: the two sentences disagree, and section 2 ("compiles the new model first") did not say where the lock is taken | `swapModel` compiles before taking the lock, and the held-lock rule names that exception (3). |
+
+**BALLAST:** the pass named nothing new. It judged the watchdog requirement useful armor.

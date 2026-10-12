@@ -30,6 +30,17 @@ pub const Options = struct {
     /// Under either setting, a line of reason `.unsupported_scheme_kind_unused` refuses nothing
     /// and fails no load.
     on_unsupported: enum { refuse_model, refuse_operation } = .refuse_model,
+    /// The bounds the load holds to.
+    limits: Limits = .{},
+};
+
+/// The bounds of design section 3, Bounds, that a load holds to, each with the default the design
+/// gives it.
+pub const Limits = struct {
+    /// Load report memory, in bytes: each listed line's record and the bytes of its service name,
+    /// operation id, pointer and name (the Bounds row "Load report memory"). Past it, lines are
+    /// counted in `Diagnostics.unlisted` instead of listed, and the load's outcome is the same.
+    load_report: usize = default_report_max,
 };
 
 /// What a load decided. It holds no pointer into the model it was made from.
@@ -67,9 +78,9 @@ pub const Error = error{
 pub fn compile(gpa: Allocator, m: *const model.Model, options: Options, diag: ?*Diagnostics) Error!Compiled {
     // Freed first, so that whatever this load returns, no earlier report is left in `diag`.
     if (diag) |d| d.deinit(gpa);
-    var checked = try check(gpa, m, default_report_max);
+    var checked = try check(gpa, m, options.limits.load_report);
     if (diag) |d| {
-        d.* = .{ .report = checked.report, .unlisted = checked.unlisted, .report_max = default_report_max, .text = checked.text };
+        d.* = .{ .report = checked.report, .unlisted = checked.unlisted, .report_max = options.limits.load_report, .text = checked.text };
     } else {
         gpa.free(checked.report);
         gpa.free(checked.text);
@@ -157,11 +168,45 @@ const Step = struct {
     edge: Edge,
 };
 
-const Pending = struct {
+/// A schema on the walk's path, from its root to the schema the walk is in.
+const Frame = struct {
     schema: *const model.Schema,
     /// This schema's index in `Checker.trail`.
     step: usize,
+    /// The index, in field order, of the next child to visit; see `childAt`.
+    next: usize = 0,
 };
+
+const Child = struct {
+    schema: *const model.Schema,
+    edge: Edge,
+};
+
+/// The `n`th child of `schema` in field order, or null past the last: `items`, each of
+/// `properties`, a schema in `additional_properties`, then each of `all_of`, `any_of` and
+/// `one_of`.
+fn childAt(schema: *const model.Schema, n: usize) ?Child {
+    var k = n;
+    if (schema.items) |items| {
+        if (k == 0) return .{ .schema = items, .edge = .items };
+        k -= 1;
+    }
+    if (k < schema.properties.len) return .{ .schema = schema.properties[k].schema, .edge = .{ .property = k } };
+    k -= schema.properties.len;
+    switch (schema.additional_properties) {
+        .schema => |additional| {
+            if (k == 0) return .{ .schema = additional, .edge = .additional };
+            k -= 1;
+        },
+        .allowed, .forbidden => {},
+    }
+    if (k < schema.all_of.len) return .{ .schema = schema.all_of[k], .edge = .{ .all_of = k } };
+    k -= schema.all_of.len;
+    if (k < schema.any_of.len) return .{ .schema = schema.any_of[k], .edge = .{ .any_of = k } };
+    k -= schema.any_of.len;
+    if (k < schema.one_of.len) return .{ .schema = schema.one_of[k], .edge = .{ .one_of = k } };
+    return null;
+}
 
 /// A listed line while the report is built. Its strings are spans of `Checker.text`, which moves
 /// as it grows.
@@ -194,6 +239,9 @@ const Name = struct {
     /// Set on the first entry of a declared scheme's name: whether a requirement naming it is
     /// refused.
     refused: bool = false,
+    /// Set on the first entry of a declared scheme's name: whether some operation's requirements
+    /// name it.
+    used: bool = false,
 };
 
 /// Fills `names` with the `field` of each of `items`, sorted by name and then by index, so that
@@ -224,12 +272,13 @@ fn orderName(name: []const u8, entry: Name) std.math.Order {
     return std.mem.order(u8, name, entry.name);
 }
 
-fn stringLessThan(_: void, a: []const u8, b: []const u8) bool {
-    return std.mem.lessThan(u8, a, b);
-}
-
-fn orderString(name: []const u8, item: []const u8) std.math.Order {
-    return std.mem.order(u8, name, item);
+/// Sets `used` on the first entry, in `sorted`, of each declared scheme `requirements` name.
+fn markUsed(sorted: []Name, requirements: []const model.Requirement) void {
+    for (requirements) |requirement| {
+        for (requirement) |use| {
+            if (findName(sorted, use.scheme)) |entry| entry.used = true;
+        }
+    }
 }
 
 const Checker = struct {
@@ -254,12 +303,12 @@ const Checker = struct {
     service_names: std.ArrayList(Name) = .empty,
     schemes: std.ArrayList(Name) = .empty,
     ids: std.ArrayList(Name) = .empty,
-    /// The scheme names some operation's requirements use.
-    used_schemes: std.ArrayList([]const u8) = .empty,
 
     // Scratch for the schema walk, reused for each operation.
     visited: std.AutoHashMapUnmanaged(*const model.Schema, void) = .empty,
-    stack: std.ArrayList(Pending) = .empty,
+    /// The path from the root to the schema the walk is in.
+    stack: std.ArrayList(Frame) = .empty,
+    /// How the walk first reached each schema it entered, one record each.
     trail: std.ArrayList(Step) = .empty,
     chain: std.ArrayList(usize) = .empty,
     /// A line's pointer while it is built, copied into `text` only if the line is listed.
@@ -271,7 +320,6 @@ const Checker = struct {
         c.service_names.deinit(c.gpa);
         c.schemes.deinit(c.gpa);
         c.ids.deinit(c.gpa);
-        c.used_schemes.deinit(c.gpa);
         c.visited.deinit(c.gpa);
         c.stack.deinit(c.gpa);
         c.trail.deinit(c.gpa);
@@ -327,23 +375,24 @@ const Checker = struct {
     fn checkService(c: *Checker, at: Site, refused: []bool) Allocator.Error!void {
         const service = at.service.?;
 
-        // Every scheme name some operation's requirements use: its own, or the service's when
-        // its own `security` is null. A scheme of a kind mock does not implement is refused only
-        // where one of these names it.
-        c.used_schemes.clearRetainingCapacity();
+        try sortNames(c.gpa, &c.schemes, service.security_schemes, "name");
+        const schemes = c.schemes.items;
+
+        // Marks each declared name that some operation's requirements use: its own, or the
+        // service's when its own `security` is null. A scheme of a kind mock does not implement is
+        // refused only where one of these names it. Marked in place, so that the memory this
+        // takes is the declarations', however many requirements name them: operations can share
+        // one requirement slice, so a small model can hold a great many uses.
         var inherits = false;
         for (service.operations) |operation| {
-            if (operation.security) |own| try c.collectSchemes(own) else inherits = true;
+            if (operation.security) |own| markUsed(schemes, own) else inherits = true;
         }
-        if (inherits) try c.collectSchemes(service.security);
-        std.mem.sort([]const u8, c.used_schemes.items, {}, stringLessThan);
+        if (inherits) markUsed(schemes, service.security);
 
         // On the first entry of each declared scheme name, whether an operation whose
         // requirements name it is refused: true when the name is declared twice, since a
         // requirement naming it is ambiguous, or when a scheme of that name is of a kind mock does
         // not implement.
-        try sortNames(c.gpa, &c.schemes, service.security_schemes, "name");
-        const schemes = c.schemes.items;
         var first: usize = 0;
         while (first < schemes.len) {
             var end = first + 1;
@@ -355,13 +404,13 @@ const Checker = struct {
             first = end;
         }
         for (service.security_schemes, 0..) |scheme, i| {
-            if (findName(schemes, scheme.name).?.index != i) {
+            const first_entry = findName(schemes, scheme.name).?;
+            if (first_entry.index != i) {
                 try c.refuse(at, "/security_schemes/{d}/name", .{i}, .duplicate_scheme_name, scheme.name);
             }
             switch (scheme.kind) {
                 .other => |kind| {
-                    const used = std.sort.binarySearch([]const u8, c.used_schemes.items, scheme.name, orderString) != null;
-                    const reason: Refusal.Reason = if (used) .unsupported_scheme_kind else .unsupported_scheme_kind_unused;
+                    const reason: Refusal.Reason = if (first_entry.used) .unsupported_scheme_kind else .unsupported_scheme_kind_unused;
                     try c.refuse(at, "/security_schemes/{d}/kind/other", .{i}, reason, kind);
                 },
                 .api_key, .http_basic, .http_bearer, .oauth2, .openid_connect => {},
@@ -407,15 +456,15 @@ const Checker = struct {
         return refused;
     }
 
-    fn collectSchemes(c: *Checker, requirements: []const model.Requirement) Allocator.Error!void {
-        for (requirements) |requirement| {
-            for (requirement) |use| try c.used_schemes.append(c.gpa, use.scheme);
-        }
-    }
-
     /// Walks every schema graph that hangs off the operation, each schema once, and returns
-    /// whether any schema was refused. The walk keeps its own stack, so a long chain of schemas
-    /// cannot overflow the call stack, and its visited set makes a pointer cycle end.
+    /// whether any schema was refused.
+    ///
+    /// The walk is depth first, over a stack of its own so that a long chain of schemas cannot
+    /// overflow the call stack. It enters a schema, marks it visited and checks it the first time
+    /// it reaches it, then takes its children one at a time in field order. So a schema is named
+    /// by the first path to it in field order, a pointer cycle ends, and the walk keeps one record
+    /// for each schema it enters and one frame for each schema on its path. Neither depends on
+    /// the edges, which the schemas do not bound: schemas can share one child slice.
     fn checkSchemas(c: *Checker, at: Site) Allocator.Error!bool {
         c.visited.clearRetainingCapacity();
         c.trail.clearRetainingCapacity();
@@ -444,54 +493,46 @@ const Checker = struct {
 
     fn walk(c: *Checker, at: Site, root: *const model.Schema, from: Root) Allocator.Error!bool {
         std.debug.assert(c.stack.items.len == 0);
-        try c.push(root, .{ .parent = null, .edge = .{ .root = from } });
-        var refused = false;
-        while (c.stack.pop()) |pending| {
-            // Marked visited when expanded, not when pushed: children are pushed last first, so
-            // they are expanded depth first in field order, and a schema reached by several paths
-            // is named by the first. A schema is expanded once, so the pushes are bounded by the
-            // edges of the graph.
-            if ((try c.visited.getOrPut(c.gpa, pending.schema)).found_existing) continue;
-            if (try c.checkSchema(at, pending)) refused = true;
-            const schema = pending.schema;
-            var i = schema.one_of.len;
-            while (i > 0) : (i -= 1) try c.push(schema.one_of[i - 1], .{ .parent = pending.step, .edge = .{ .one_of = i - 1 } });
-            i = schema.any_of.len;
-            while (i > 0) : (i -= 1) try c.push(schema.any_of[i - 1], .{ .parent = pending.step, .edge = .{ .any_of = i - 1 } });
-            i = schema.all_of.len;
-            while (i > 0) : (i -= 1) try c.push(schema.all_of[i - 1], .{ .parent = pending.step, .edge = .{ .all_of = i - 1 } });
-            switch (schema.additional_properties) {
-                .schema => |additional| try c.push(additional, .{ .parent = pending.step, .edge = .additional }),
-                .allowed, .forbidden => {},
-            }
-            i = schema.properties.len;
-            while (i > 0) : (i -= 1) try c.push(schema.properties[i - 1].schema, .{ .parent = pending.step, .edge = .{ .property = i - 1 } });
-            if (schema.items) |items| try c.push(items, .{ .parent = pending.step, .edge = .items });
+        var refused = try c.enter(at, root, .{ .parent = null, .edge = .{ .root = from } });
+        while (c.stack.items.len > 0) {
+            const top = &c.stack.items[c.stack.items.len - 1];
+            const child = childAt(top.schema, top.next) orelse {
+                _ = c.stack.pop();
+                continue;
+            };
+            top.next += 1;
+            // Read before entering the child, which can move the stack and `top` with it.
+            const parent = top.step;
+            if (try c.enter(at, child.schema, .{ .parent = parent, .edge = child.edge })) refused = true;
         }
         return refused;
     }
 
-    fn push(c: *Checker, schema: *const model.Schema, step: Step) Allocator.Error!void {
-        if (c.visited.contains(schema)) return;
+    /// Enters `schema` unless the walk has entered it before: records how it was reached, checks
+    /// it and puts it on the path. Returns whether it was refused.
+    fn enter(c: *Checker, at: Site, schema: *const model.Schema, step: Step) Allocator.Error!bool {
+        if ((try c.visited.getOrPut(c.gpa, schema)).found_existing) return false;
         try c.trail.append(c.gpa, step);
-        try c.stack.append(c.gpa, .{ .schema = schema, .step = c.trail.items.len - 1 });
+        const frame: Frame = .{ .schema = schema, .step = c.trail.items.len - 1 };
+        try c.stack.append(c.gpa, frame);
+        return c.checkSchema(at, frame);
     }
 
     /// Returns whether the schema itself, not counting its children, was refused, whether or not
     /// its lines were listed.
-    fn checkSchema(c: *Checker, at: Site, pending: Pending) Allocator.Error!bool {
+    fn checkSchema(c: *Checker, at: Site, frame: Frame) Allocator.Error!bool {
         // Whether `c.pointer` holds this schema's pointer: built for its first listed line, then
         // shared by the others.
         var built = false;
         var refused = false;
-        if (pending.schema.pattern != null) {
+        if (frame.schema.pattern != null) {
             refused = true;
-            try c.refuseKeyword(at, pending.step, &built, "pattern");
+            try c.refuseKeyword(at, frame.step, &built, "pattern");
         }
-        for (pending.schema.other_keywords) |keyword| {
+        for (frame.schema.other_keywords) |keyword| {
             if (isAnnotation(keyword)) continue;
             refused = true;
-            try c.refuseKeyword(at, pending.step, &built, keyword);
+            try c.refuseKeyword(at, frame.step, &built, keyword);
         }
         return refused;
     }
@@ -1464,4 +1505,149 @@ test "compile: no leak or double free when any allocation fails" {
         try testing.checkAllAllocationFailures(testing.allocator, load, .{ &m, Options{ .on_unsupported = .refuse_model } });
         try testing.checkAllAllocationFailures(testing.allocator, load, .{ &identity, Options{} });
     }
+}
+
+/// The result of `loadWithin`, held in its buffer.
+const Within = struct {
+    compiled: Compiled,
+    diag: Diagnostics,
+};
+
+/// Loads `m` with every allocation, the result's included, taken from `buffer`, so that a load
+/// whose memory is not bounded by the size of the model fails with `error.OutOfMemory` instead
+/// of passing. Logs how long the load took and where it left the buffer's end, at `.info`: the
+/// test runner shows that only when `std.testing.log_level` is raised, because any test output
+/// on stderr makes `zig build test` print its command as failed though every test passed.
+fn loadWithin(buffer: []u8, m: *const model.Model, options: Options, what: []const u8) !Within {
+    var fba: std.heap.FixedBufferAllocator = .init(buffer);
+    var diag: Diagnostics = .{};
+    const start = std.Io.Timestamp.now(testing.io, .awake).nanoseconds;
+    const compiled = try compile(fba.allocator(), m, options, &diag);
+    const took = std.Io.Timestamp.now(testing.io, .awake).nanoseconds - start;
+    std.log.info("{s}: loaded in {d} ms, ending {d} bytes into a buffer of {d}\n", .{ what, @divTrunc(took, std.time.ns_per_ms), fba.end_index, buffer.len });
+    return .{ .compiled = compiled, .diag = diag };
+}
+
+test "compile: requirements many operations share take memory for the schemes declared, not for each use" {
+    const gpa = testing.allocator;
+    // 2,000 operations share one slice of 2,000 requirements, each naming "auth": 4,000,000 uses
+    // held in a few thousand values. Keeping a record of each use would take 64 MB.
+    const uses = [_]model.SchemeUse{.{ .scheme = "auth" }};
+    const requirements = try gpa.alloc(model.Requirement, 2_000);
+    defer gpa.free(requirements);
+    @memset(requirements, &uses);
+    const ids = try gpa.alloc([4]u8, 2_000);
+    defer gpa.free(ids);
+    const operations = try gpa.alloc(model.Operation, ids.len);
+    defer gpa.free(operations);
+    for (operations, ids, 0..) |*operation, *id, i| {
+        _ = std.fmt.bufPrint(id, "{d:0>4}", .{i}) catch unreachable;
+        operation.* = op(id, ok(&plain));
+        operation.security = requirements;
+    }
+    // "legacy" is of a kind mock does not implement and no requirement names it, so its line
+    // refuses nothing. Marking it used would fail the load; leaving "auth" unmarked changes
+    // nothing here, since "auth" is of a kind mock implements.
+    const schemes = [_]model.SecurityScheme{
+        .{ .name = "auth", .kind = .{ .http_bearer = .{} } },
+        .{ .name = "legacy", .kind = .{ .other = "custom" } },
+    };
+    const services = [_]model.Service{.{ .name = "s", .security_schemes = &schemes, .operations = operations }};
+    const m: model.Model = .{ .services = &services };
+
+    // The load ends about 0.1 MiB into the buffer, measured.
+    const buffer = try gpa.alloc(u8, 1 << 20);
+    defer gpa.free(buffer);
+    const loaded = try loadWithin(buffer, &m, .{}, "4,000,000 uses of one scheme");
+    try testing.expectEqualDeep(&[_]Refusal{
+        .{ .service = "s", .operation = null, .pointer = "/services/0/security_schemes/1/kind/other", .reason = .unsupported_scheme_kind_unused, .name = "custom" },
+    }, loaded.diag.report);
+    try testing.expectEqual(@as(u64, 0), loaded.diag.unlisted);
+    try testing.expectEqual(1, loaded.compiled.refused.len);
+    try testing.expectEqual(ids.len, loaded.compiled.refused[0].len);
+    try testing.expect(std.mem.allEqual(bool, loaded.compiled.refused[0], false));
+}
+
+test "compile: schemas that share one child slice take memory for the schemas, not for the edges" {
+    const gpa = testing.allocator;
+    // 2,000 schemas share one slice of 2,000 properties, one naming each of them: 4,000,000 edges
+    // held in a few thousand values. Queuing a schema at each edge that reaches it before the
+    // walk enters it would keep about 2,000,000 records.
+    const schemas = try gpa.alloc(model.Schema, 2_000);
+    defer gpa.free(schemas);
+    const properties = try gpa.alloc(model.Property, schemas.len);
+    defer gpa.free(properties);
+    const names = try gpa.alloc([4]u8, schemas.len);
+    defer gpa.free(names);
+    for (schemas, properties, names, 0..) |*schema, *property, *name, i| {
+        _ = std.fmt.bufPrint(name, "{d:0>4}", .{i}) catch unreachable;
+        property.* = .{ .name = name, .schema = schema };
+        schema.* = .{ .properties = properties };
+    }
+    // Refused only in the last schema. From schema i, properties 0 to i lead to schemas already
+    // entered, so the first path to it in field order runs through every other schema in turn.
+    schemas[schemas.len - 1].other_keywords = &.{"not"};
+    const content = [_]model.MediaContent{.{ .media_type = "application/json", .schema = &schemas[0] }};
+    const responses = [_]model.Response{.{ .status = .{ .code = 200 }, .content = &content }};
+    const operations = [_]model.Operation{op("o", &responses)};
+    const services = [_]model.Service{.{ .name = "s", .operations = &operations }};
+    const m: model.Model = .{ .services = &services };
+
+    var pointer: std.ArrayList(u8) = .empty;
+    defer pointer.deinit(gpa);
+    try pointer.appendSlice(gpa, "/services/0/operations/0/responses/0/content/0/schema");
+    for (1..schemas.len) |i| try pointer.print(gpa, "/properties/{d}/schema", .{i});
+
+    // The load ends about 0.8 MiB into the buffer, measured: a fixed buffer's allocator frees
+    // only its last allocation, so each array that grows leaves its old copies behind.
+    const buffer = try gpa.alloc(u8, 4 << 20);
+    defer gpa.free(buffer);
+    const loaded = try loadWithin(buffer, &m, .{ .on_unsupported = .refuse_operation }, "4,000,000 edges between 2,000 schemas");
+    try testing.expectEqualDeep(&[_]Refusal{
+        .{ .service = "s", .operation = "o", .pointer = pointer.items, .reason = .unsupported_keyword, .name = "not" },
+    }, loaded.diag.report);
+    try testing.expectEqualDeep(&[_][]const bool{&.{true}}, loaded.compiled.refused);
+}
+
+test "compile: Options.limits.load_report bounds the report, and the printed report names the bound" {
+    const gpa = testing.allocator;
+    const schema: model.Schema = .{ .other_keywords = &.{ "not", "if", "then" } };
+    const content = [_]model.MediaContent{.{ .media_type = "application/json", .schema = &schema }};
+    const responses = [_]model.Response{.{ .status = .{ .code = 200 }, .content = &content }};
+    const operations = [_]model.Operation{op("o", &responses)};
+    const services = [_]model.Service{.{ .name = "s", .operations = &operations }};
+    const m: model.Model = .{ .services = &services };
+    const where = "/services/0/operations/0/responses/0/content/0/schema";
+
+    var whole: Loaded = .init(&m, .{});
+    defer whole.deinit();
+    try whole.expectModelRefused();
+    try testing.expectEqual(3, whole.diag.report.len);
+    try testing.expectEqual(default_report_max, whole.diag.report_max);
+
+    // Room for the lines refusing "not" and "if", and not for "then".
+    const bound = 2 * (@sizeOf(Refusal) + "s".len + "o".len + where.len) + "not".len + "if".len;
+    var bounded: Loaded = .init(&m, .{ .limits = .{ .load_report = bound } });
+    defer bounded.deinit();
+    try bounded.expectModelRefused();
+    try testing.expectEqual(bound, bounded.diag.report_max);
+    try testing.expectEqual(@as(u64, 1), bounded.diag.unlisted);
+    const printed = try std.fmt.allocPrint(gpa, "{f}", .{bounded.diag});
+    defer gpa.free(printed);
+    const expected = try std.fmt.allocPrint(gpa,
+        \\service "s", operation "o", {s}: unsupported keyword "not"
+        \\service "s", operation "o", {s}: unsupported keyword "if"
+        \\1 more not listed: the report keeps at most {d} bytes
+        \\
+    , .{ where, where, bound });
+    defer gpa.free(expected);
+    try testing.expectEqualStrings(expected, printed);
+}
+
+test "compile: the report's bound defaults to the design's 1 MiB" {
+    // The Bounds row "Load report memory" gives 1 MiB, so changing it here is changing the design.
+    try testing.expectEqual(@as(usize, 1 << 20), default_report_max);
+    try testing.expectEqual(default_report_max, (Limits{}).load_report);
+    try testing.expectEqual(default_report_max, (Options{}).limits.load_report);
+    try testing.expectEqual(default_report_max, (Diagnostics{}).report_max);
 }

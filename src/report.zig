@@ -6,8 +6,7 @@ const Allocator = std.mem.Allocator;
 
 /// The most memory the load report holds: each listed line's record and the bytes of the service
 /// name, operation id, pointer and name it holds (design section 3, Bounds). Past it, lines are
-/// counted in `Diagnostics.unlisted` instead. A default that `Options.limits` is to take over when
-/// it exists.
+/// counted in `Diagnostics.unlisted` instead. The default of `Limits.load_report`.
 pub const default_report_max: usize = 1 << 20;
 
 /// One line of the load report.
@@ -116,7 +115,7 @@ pub const Diagnostics = struct {
     /// The lines past the bound: counted, not listed. The load's outcome is the same as if they
     /// had been listed.
     unlisted: u64 = 0,
-    /// The bound `report` was built with, in bytes.
+    /// The bound `report` was built with, in bytes: the load's `Limits.load_report`.
     report_max: usize = default_report_max,
     /// The bytes the strings in `report` point into.
     text: []const u8 = &.{},

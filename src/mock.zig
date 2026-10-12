@@ -42,6 +42,7 @@ pub const Number = value.Number;
 pub const Member = value.Member;
 
 pub const Options = compile.Options;
+pub const Limits = compile.Limits;
 pub const Diagnostics = report.Diagnostics;
 pub const Refusal = report.Refusal;
 

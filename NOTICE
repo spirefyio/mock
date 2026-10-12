@@ -1,0 +1,11 @@
+mock
+Copyright 2026 Spirefy
+
+This product is licensed under the Apache License, Version 2.0; see LICENSE.
+
+Third-party code and test vectors
+---------------------------------
+
+None. When code or test vectors from another project are adapted or included, each source is
+listed here with its project, URL, the commit it was taken from, and its license, and an
+Apache-2.0 source's own NOTICE text is carried into this file.

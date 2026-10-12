@@ -7,9 +7,10 @@ SOAP server, the message broker, and the identity provider that issues the token
 the process that uses it. A test describes the API it needs and `mock` serves it, with no
 containers and no outside services.
 
-> **Status: design.** There is no code yet. This README sets out the scope we are building
-> toward. It is not a list of things that work. An item counts as working only once it passes
-> against independent software (see [How it is checked](#how-it-is-checked)).
+> **Status: early construction.** The first slice is being built in stages, and nothing is usable
+> yet. This README sets out the scope we are building toward. It is not a list of things that
+> work. An item counts as working only once it passes against independent software (see
+> [How it is checked](#how-it-is-checked)).
 
 ## Why
 

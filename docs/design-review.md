@@ -137,3 +137,34 @@ BALLAST it named, and what was done:
 
 From CHECKED CLEAN: std's drain before responding is conditional on keeping the connection alive
 (`lib/std/http/Server.zig:348-350`); section 3 now says so.
+
+## Pass 3
+
+- Reviewed: the fix delta `4fafcd5..67e152b` (pass 2's fixes), read-only, with pass 2's findings
+  and their dispositions.
+- Model: `gpt-6.1-sol`, reasoning effort `max`.
+- Verdict: **REWORK** — "the stated lifecycle contract can deadlock during cleanup, and the
+  record-state and error-response guarantees still need correction."
+- Fixed in the commit that follows this record. **That fix delta has not had its own pass:** three
+  passes was the cap set for this design, so a fourth pass over it is owed before the design is
+  accepted.
+
+Pass 2's items: F4, F8, F14-F16, F19, F23, F25-F27, F31, F32 and F34-F40 closed. F5, F7 and F33
+closed in part; what remained is F42, F41 and F44 below.
+
+| # | Sev. | Finding (short) | Disposition and evidence | Change |
+|---|---|---|---|---|
+| F41 | HIGH | `deinit` takes the lifecycle lock and then calls `stop`, which takes it again | CONFIRMED-BY-READING: `Io.Mutex.lock` (`lib/std/Io.zig:1602`) waits on a held mutex and keeps no owner, so the second take never returns | Each public call takes the lock once; `deinit` runs the stop steps through internal functions; exclusive ownership at `deinit` stated; a plant (3, 8) |
+| F42 | MED | "A test that has received only a 100 finds it `pending`" promises a state the server may have left | CONFIRMED-BY-READING: the server may read the body and answer before the test looks | The entry exists after a 100, `pending` or later (3) |
+| F43 | LOW | The status for framing overhead past the head limit | PARTIAL: "any other breach is 400" excluded that case rather than giving it a second answer, but no status was stated for it | 431 past the limit, 413 for the body, 400 for malformed framing (3) |
+| F44 | LOW | Open question 2 restated the pass-1 rule without `default` | CONFIRMED-BY-READING | It now points at 4.4 (10) |
+
+Recommendations R25-R29 (the strict chunked decoder; 100 at the token endpoint before client
+authentication; outcomes decided together with "malformed" narrowed; one lifecycle lock; the store's
+kind check kept as armor behind shape dispatch): the pass agreed with all five, R25 and R28 subject
+to F43 and F41.
+
+BALLAST it named, and what was done: three survey rows still claimed absence universally ("exists
+anywhere", "No Zig SAML IdP exists", "No licensed Zig 0.16 validator or executor exists"); each now
+says what the survey found (7). The real-socket blocked-writer run, survey counts, custom schemes and
+`Prefer` were judged correctly labelled; unchanged.

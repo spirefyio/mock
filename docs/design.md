@@ -314,7 +314,8 @@ mock's parser, bounded by the limits in this section:
   must match the `chunk-ext` grammar (§7.1.1) and is then ignored. The trailer section (§7.1.2) is
   parsed with the header grammar and discarded, never merged into the headers. Chunk-size lines,
   extensions and trailers count against the request-head limit, so leading zeros or long
-  extensions cannot make framing unbounded. Any other breach is 400, and the connection is closed.
+  extensions cannot make framing unbounded; past it the answer is 431, as for the head. Malformed
+  framing is 400. In every case the connection is closed.
 - `Expect: 100-continue` is answered with 100 only after the head has passed the Host check,
   routing, authentication and the size limit. If any of those fails, the final response is sent
   instead. Every scheme in the first slice reads its credential from the head (5.2), so this order
@@ -429,9 +430,14 @@ closed and possibly reused by the OS.
 - `start`, `stop`, `swapModel` and `deinit` take one lifecycle lock, because `Future.cancel` and
   `Group.cancel` are not thread-safe (`lib/std/Io.zig:1191`, `:1298`): a second `stop` on another
   thread waits for the first, then returns. No task of the mock takes that lock, so `stop` can
-  await tasks while holding it.
-- `stop` is idempotent; `deinit` calls it. A stopped mock keeps its record until `deinit`, and no
-  task of a mock outlives its `stop`.
+  await tasks while holding it. The lock is not recursive (`Io.Mutex.lock`, `lib/std/Io.zig:1602`),
+  so each public call takes it once and does its work through internal functions that expect it
+  held; `deinit` runs the stop steps that way, never by calling `stop`.
+- `deinit` is the last call on a mock. The caller must own the mock exclusively by then, with no
+  other thread inside or waiting on any of its methods, because `deinit` frees the lock with
+  everything else.
+- `stop` is idempotent, and `deinit` stops a running mock first. A stopped mock keeps its record
+  until `deinit`, and no task of a mock outlives its `stop`.
 
 ### Bounds
 
@@ -503,7 +509,8 @@ becomes `answered`, with its status, before the first byte of the final response
 accepted (a malformed or oversized head, the connection bound, a failed spawn) gets an entry too,
 published as `answered` with its status, its reason and whatever of the head was read, before its
 response is written. So a test that has received any byte of a final response finds the entry with
-its status, and a test that has received only a 100 finds it `pending`. Two things end the promise,
+its status, and a test that has received a 100 finds the entry, `pending` or in any later state,
+since the server may move on before the test looks. Two things end the promise,
 both visibly: past the record bound, entries are counted, not stored, and queries return
 `error.RecordOverflow` (Bounds); and `clear()` removes every entry, in-flight ones included, after
 which an update to a removed entry is discarded.
@@ -982,13 +989,13 @@ The signature primitives are std's (5.2), so nothing is borrowed for them.
 | TLS server, mTLS | NerdMeNot/parley | Apache-2.0 OR ISC | TLS 1.2 and 1.3 server with client certificates | Claims BoGo, Wycheproof and interop; 239 tests; one contributor, no stars, a single push (2026-05-25) |
 | | ianic/tls.zig, branch `zig-0.16.x` | MIT | TLS 1.3 server with a `client_auth` option | TLS 1.3 only; tlsfuzzer scripts; 11 contributors |
 | | mattrobenolt/ztls | Apache-2.0 | Sans-I/O TLS 1.3 client and server with client certificates | Pre-alpha; about 1,000 tests |
-| X.509 issuance | (ours, on std) | | A certificate builder on `std.crypto.codecs.asn1.der` (`lib/std/crypto/codecs/asn1/der.zig:19`) and `Oid` | No complete builder exists anywhere; the fragments below help |
+| X.509 issuance | (ours, on std) | | A certificate builder on `std.crypto.codecs.asn1.der` (`lib/std/crypto/codecs/asn1/der.zig:19`) and `Oid` | The survey found no complete builder; the fragments below help |
 | | kacy/yoq `src/tls/x509_gen.zig`, `csr.zig` | MIT | An ECDSA P-256 CA and a leaf it signs | Fragment |
 | | techsaint/zig_iroh `acme/x509.zig` | Apache-2.0 | A DER writer and CSR, ECDSA | Fragment |
 | XML | ianprime0509/zig-xml | 0BSD | Parser | Seven contributors, a W3C xmlconf runner, fuzzing; no DTD support |
 | | zaxified/zig-libs `xml` | MIT | Namespace-aware parser that refuses DOCTYPE, never expands entities, and has limits | AI-written |
 | Exclusive C14N, XML-DSig | zaxified/zig-libs `xmldsig` | MIT | Canonicalization and verification | Verifies only; the survey found no signing or XPath, so we expect to write them |
-| SAML | (ours) | | An identity provider | No Zig SAML IdP exists; zig-libs `saml` is service-provider side only |
+| SAML | (ours) | | An identity provider | The survey found no Zig SAML IdP; zig-libs `saml` is service-provider side only |
 | SCRAM | securemessage/xmppd `lib/sasl/scram.zig` | BSD-2-Clause | Server and client, channel binding, SASLprep with NFC tables | SHA-1 and SHA-256 only; Zig 0.15.2+ per its README |
 | | meszmate/smtp.zig `src/auth/scram.zig` | MIT | SHA-256 with RFC 7677 vectors | |
 | | mattrobenolt/kafka-zig `src/scram` | Apache-2.0 | SHA-256 and SHA-512 | Client only; Zig 0.15.2 |
@@ -1001,7 +1008,7 @@ The signature primitives are std's (5.2), so nothing is borrowed for them.
 | AMQP 0-9-1 | malcolmstill/zig-amqp | BSD-3-Clause | The frame codec | Zig 0.13; the survey found no Zig broker, so the broker is ours |
 | `pattern` | zoptia0regex | Apache-2.0 | A linear-time regular-expression engine | RE2-class, not ECMAScript-compatible; the survey found no ECMAScript-compatible engine in Zig, so the dialect gap must be closed or refused by name |
 | HTTP/2, gRPC | zaxified/zig-libs `grpc`, `http`; Arwalk/zig-protobuf (tag `zig-0.16.0`, claims the protobuf conformance suite); hendriknielaender/http2.zig; zoxy-io/hpack; c4milo/colibri (h2spec 144 of 146) | MIT, MIT, MIT, MIT, Apache-2.0 | Held until gRPC is scheduled | |
-| GraphQL | none | | | No licensed Zig 0.16 validator or executor exists |
+| GraphQL | none | | | The survey found no licensed Zig 0.16 validator or executor |
 | Deterministic tests | zaxified/zig-libs `simio` | MIT | A deterministic `std.Io` with virtual time, for testing timeouts and the sweeper | AI-written |
 
 **Not usable**
@@ -1098,6 +1105,7 @@ entry point), not inside a helper, except where a row says why it cannot be.
 | The record drops entries past its bound silently | Fill the record to its bound plus one: the query must return `error.RecordOverflow`, not the first N entries. |
 | The connection bound not enforced | Hold the bound's number of connections open, each confirmed accepted by its `pending` record entry; one more must get 503. |
 | `stop` waits on a client that never reads | On a deterministic test `Io` whose write blocks by construction, a client that never reads and a hook that signals the response write is blocked; only then is `stop` called, and it must return within the test's time limit. The same test on a real socket, with a body several times the two sockets' buffer sizes as the system reports them (and `limits` raised to allow it), is a smoke test only: it cannot prove the write had blocked. |
+| `deinit` takes the lifecycle lock again through `stop` | A started mock passed to `deinit` without a `stop` first must return within the test's time limit. |
 | A value is sent without the final validation | A unit test that hands the send boundary a value its schema forbids must get 500. The plant removes that check; the test then sees a 200. |
 | Equality by source text (`[1, 1.0]` passes `uniqueItems`) | The JSON-Schema-Test-Suite `uniqueItems` cases. |
 
@@ -1220,9 +1228,10 @@ pub const Options = struct {
 
 1. **Deferring the token endpoint.** Ship client credentials in the first slice (5.5) or defer it
    and mint tokens only in code?
-2. **Declared error shapes.** A validation failure is answered with the operation's declared 400 or
-   422 response when it has one, and with mock's problem document otherwise (4.4). Is that the right
-   default, or should mock's own document be the default and the declared shape the option?
+2. **Declared error shapes.** A request refused at validation is answered with the operation's own
+   declared response for that status, chosen as 4.4 says, and with mock's problem document only when
+   the operation declares none. Is that the right default, or should mock's own document be the
+   default and the declared shape the option?
 3. **Custom schemes.** Should users be able to add their own auth scheme (for example a signed-request
    scheme), which would need a run-time interface beside the tagged union?
 4. **A test clock.** Token times come from the real clock. Is a settable clock worth adding, so a test

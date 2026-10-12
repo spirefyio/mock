@@ -253,7 +253,9 @@ pub const Client = struct {
     scopes: []const []const u8 = &.{},
     token: enum { jwt, opaque_token } = .jwt,
     /// Which key signs its JWTs; null means the provider's first key. An `alg` that no key in
-    /// `Identity.keys` has fails the load whatever `Options.on_unsupported` says.
+    /// `Identity.keys` has fails the load whatever `Options.on_unsupported` says, and so does a
+    /// null `alg` on a `.jwt` client when `Identity.keys` is empty. An `.opaque_token` client with
+    /// a null `alg` signs nothing and needs no key.
     alg: ?Alg = null,
     /// When set, every token the client gets is wrong in this one way.
     defect: ?Defect = null,

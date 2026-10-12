@@ -7,6 +7,7 @@
 const std = @import("std");
 const compile = @import("compile.zig");
 const model = @import("model.zig");
+const report = @import("report.zig");
 const value = @import("value.zig");
 
 pub const Model = model.Model;
@@ -41,12 +42,13 @@ pub const Number = value.Number;
 pub const Member = value.Member;
 
 pub const Options = compile.Options;
-pub const Diagnostics = compile.Diagnostics;
-pub const Refusal = compile.Refusal;
+pub const Diagnostics = report.Diagnostics;
+pub const Refusal = report.Refusal;
 
 test {
     std.testing.refAllDecls(@This());
     _ = compile;
     _ = model;
+    _ = report;
     _ = value;
 }

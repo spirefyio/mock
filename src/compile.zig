@@ -10,12 +10,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const model = @import("model.zig");
-
-/// The most memory the load report holds: each listed line's record and the bytes of the service
-/// name, operation id, pointer and name it holds (design section 3, Bounds). Past it, lines are
-/// counted in `Diagnostics.unlisted` instead. A default that `Options.limits` is to take over when
-/// it exists.
-const default_report_max: usize = 1 << 20;
+const Refusal = @import("report.zig").Refusal;
+const Diagnostics = @import("report.zig").Diagnostics;
+const default_report_max = @import("report.zig").default_report_max;
 
 pub const Options = struct {
     /// What a refusal does to the load.
@@ -26,141 +23,13 @@ pub const Options = struct {
     ///   operation needs, such as a scheme name used twice that no requirement names, refuses
     ///   nothing. Two refusals still fail the load. A service name used twice, because the name
     ///   is how the service is addressed and no operation of either service could be told apart
-    ///   from the other's. And an identity client whose `alg` names no key the provider holds,
+    ///   from the other's. And an identity client with no key to sign with: one whose `alg` names
+    ///   no key the provider holds, or a JWT client with a null `alg` on a provider with no keys,
     ///   because clients are the test's own configuration, not part of an API it imports.
     ///
     /// Under either setting, a line of reason `.unsupported_scheme_kind_unused` refuses nothing
     /// and fails no load.
     on_unsupported: enum { refuse_model, refuse_operation } = .refuse_model,
-};
-
-/// One line of the load report.
-pub const Refusal = struct {
-    /// Null when the refused item is in no service: an identity client.
-    service: ?[]const u8,
-    /// Null when the refused item is not in one operation: a scheme a service declares, the
-    /// requirements it gives operations whose own `security` is null, or an identity client.
-    operation: ?[]const u8,
-    /// A JSON pointer (RFC 6901) from the model's root to the refused item, through the model
-    /// types' field names and slice indices, such as
-    /// "/services/0/operations/2/parameters/0/schema/items". A schema reached by more than one path
-    /// is named by the first in field order: the check goes depth first, through each schema's
-    /// children in the order of `Schema`'s fields.
-    pointer: []const u8,
-    reason: Reason,
-    /// What was refused: the keyword, the scheme a requirement names, the scheme kind, the name
-    /// used twice, or the `alg` a client names.
-    name: []const u8,
-
-    pub const Reason = enum {
-        duplicate_service_name,
-        duplicate_operation_id,
-        duplicate_scheme_name,
-        unknown_scheme,
-        /// A declared scheme of kind `other` that some operation's requirements name.
-        unsupported_scheme_kind,
-        /// A declared scheme of kind `other` that no operation's requirements name. The one
-        /// reason that refuses nothing: no request is checked against the scheme, so the line
-        /// fails no load under either `Options.on_unsupported` and marks no operation.
-        unsupported_scheme_kind_unused,
-        unsupported_keyword,
-        /// An identity client whose `alg` names no key the provider holds.
-        no_key_for_alg,
-    };
-
-    /// Writes the refusal as one line with no line break, such as
-    /// `service "pets", operation "getPet", /services/0/operations/0/parameters/0/schema:
-    /// unsupported keyword "not"`. A line in no service starts at its pointer. Names are written
-    /// as JSON strings, with each byte that is not part of a valid UTF-8 sequence written as
-    /// U+FFFD, so a name holding a quote, a line break or invalid UTF-8 still gives one line of
-    /// valid UTF-8; the report itself keeps the name's bytes as they were. A line that refuses
-    /// nothing ends `named by no requirement, refuses nothing`.
-    ///
-    /// Errors: `error.WriteFailed` when `w` fails.
-    pub fn format(r: Refusal, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (r.service) |service| {
-            try w.writeAll("service ");
-            try writeName(w, service);
-            if (r.operation) |id| {
-                try w.writeAll(", operation ");
-                try writeName(w, id);
-            }
-            try w.writeAll(", ");
-        }
-        const what = switch (r.reason) {
-            .duplicate_service_name => "service name used twice",
-            .duplicate_operation_id => "operation id used twice",
-            .duplicate_scheme_name => "security scheme name used twice",
-            .unknown_scheme => "no security scheme named",
-            .unsupported_scheme_kind, .unsupported_scheme_kind_unused => "unsupported security scheme kind",
-            .unsupported_keyword => "unsupported keyword",
-            .no_key_for_alg => "no key of the identity provider has alg",
-        };
-        try w.print("{s}: {s} ", .{ r.pointer, what });
-        try writeName(w, r.name);
-        if (r.reason == .unsupported_scheme_kind_unused) try w.writeAll(", named by no requirement, refuses nothing");
-    }
-};
-
-/// Writes `name` as a JSON string, each byte that is not part of a valid UTF-8 sequence as
-/// U+FFFD. `std.json.fmt` would write such a name as an array of numbers.
-fn writeName(w: *std.Io.Writer, name: []const u8) std.Io.Writer.Error!void {
-    try w.writeByte('"');
-    // The start of the valid sequences not yet written.
-    var start: usize = 0;
-    var i: usize = 0;
-    while (i < name.len) {
-        const len: usize = std.unicode.utf8ByteSequenceLength(name[i]) catch 0;
-        if (len != 0 and len <= name.len - i and std.unicode.utf8ValidateSlice(name[i..][0..len])) {
-            i += len;
-            continue;
-        }
-        try std.json.Stringify.encodeJsonStringChars(name[start..i], .{}, w);
-        try w.writeAll("\u{FFFD}");
-        i += 1;
-        start = i;
-    }
-    try std.json.Stringify.encodeJsonStringChars(name[start..], .{}, w);
-    try w.writeByte('"');
-}
-
-/// Carries the load report out of `compile`, which a Zig error cannot.
-pub const Diagnostics = struct {
-    /// The lines of the last load given this `Diagnostics`, in the order the checks met them:
-    /// each service in turn, and in a service its name, its schemes, its requirements, then each
-    /// operation; then the identity provider's clients. Listed while the memory they take stays
-    /// within `report_max`: each line's record, and the bytes of its service name, operation id,
-    /// pointer and name. The first line that would take it past and every one after it are
-    /// counted in `unlisted` instead. Empty after a load with nothing to report, and after
-    /// `error.OutOfMemory`.
-    report: []const Refusal = &.{},
-    /// The lines past the bound: counted, not listed. The load's outcome is the same as if they
-    /// had been listed.
-    unlisted: u64 = 0,
-    /// The bound `report` was built with, in bytes.
-    report_max: usize = default_report_max,
-    /// The bytes the strings in `report` point into.
-    text: []const u8 = &.{},
-
-    /// Frees the report and leaves `d` empty and reusable. `gpa` is the allocator given to the
-    /// load that filled it.
-    pub fn deinit(d: *Diagnostics, gpa: Allocator) void {
-        gpa.free(d.report);
-        gpa.free(d.text);
-        d.* = .{};
-    }
-
-    /// Writes each line of the report, each ending in a line break, then, when lines are past
-    /// the bound, a last line with their count and the bound, such as
-    /// `2 more not listed: the report keeps at most 1048576 bytes`.
-    ///
-    /// Errors: `error.WriteFailed` when `w` fails.
-    pub fn format(d: Diagnostics, w: *std.Io.Writer) std.Io.Writer.Error!void {
-        for (d.report) |line| try w.print("{f}\n", .{line});
-        if (d.unlisted != 0) {
-            try w.print("{d} more not listed: the report keeps at most {d} bytes\n", .{ d.unlisted, d.report_max });
-        }
-    }
 };
 
 /// What a load decided. It holds no pointer into the model it was made from.
@@ -191,7 +60,7 @@ pub const Error = error{
 ///
 /// Errors:
 /// - `error.ModelRefused` when there is any refusal under `.refuse_model`, or, under either
-///   setting, a service name used twice or a client whose `alg` names no key. A line of reason
+///   setting, a service name used twice or a client with no key to sign with. A line of reason
 ///   `.unsupported_scheme_kind_unused` is not a refusal here. Lines past the report's bound count
 ///   exactly as listed ones do;
 /// - `error.OutOfMemory`, after which `diag` holds an empty report.
@@ -437,15 +306,21 @@ const Checker = struct {
     }
 
     /// A client's `alg` must name a key the provider holds. A null `alg` names none: it takes the
-    /// provider's first key (design section 2).
+    /// provider's first key (design section 2), so a JWT client with a null `alg` needs the
+    /// provider to hold some key. An opaque-token client with a null `alg` signs nothing and needs
+    /// none; one whose `alg` is set is held to it all the same, as the design states it.
     fn checkIdentity(c: *Checker, identity: model.Identity) Allocator.Error!void {
         var held: std.EnumSet(model.Alg) = .initEmpty();
         for (identity.keys) |key| held.insert(key.alg);
         for (identity.clients, 0..) |client, i| {
-            const alg = client.alg orelse continue;
-            if (held.contains(alg)) continue;
-            c.model_wide = true;
-            try c.refuse(.{}, "/identity/clients/{d}/alg", .{i}, .no_key_for_alg, @tagName(alg));
+            if (client.alg) |alg| {
+                if (held.contains(alg)) continue;
+                c.model_wide = true;
+                try c.refuse(.{}, "/identity/clients/{d}/alg", .{i}, .no_key_for_alg, @tagName(alg));
+            } else if (client.token == .jwt and identity.keys.len == 0) {
+                c.model_wide = true;
+                try c.refuse(.{}, "/identity/clients/{d}/alg", .{i}, .no_signing_key, client.id);
+            }
         }
     }
 
@@ -1272,6 +1147,45 @@ test "compile: a client whose alg names no key the provider holds fails the load
     try loaded.expectRefused(&.{&.{false}});
 }
 
+test "compile: a JWT client with a null alg on a provider with no keys fails the load under either setting" {
+    // A null alg takes the first key, and there is none: the client could get no token.
+    const m: model.Model = .{
+        .services = &.{.{ .name = "s", .operations = &.{op("o", ok(&plain))} }},
+        .identity = .{ .keys = &.{}, .clients = &.{.{ .id = "jwt", .secret = "x" }} },
+    };
+    for ([_]Options{ .{ .on_unsupported = .refuse_model }, .{ .on_unsupported = .refuse_operation } }) |options| {
+        var loaded: Loaded = .init(&m, options);
+        defer loaded.deinit();
+        try loaded.expectModelRefused();
+        try loaded.expectRefusals(&.{.{ .service = null, .operation = null, .pointer = "/identity/clients/0/alg", .reason = .no_signing_key, .name = "jwt" }});
+    }
+}
+
+test "compile: an opaque-token client with a null alg needs no key" {
+    const m: model.Model = .{
+        .services = &.{.{ .name = "s", .operations = &.{op("o", ok(&plain))} }},
+        .identity = .{ .keys = &.{}, .clients = &.{.{ .id = "opaque", .secret = "x", .token = .opaque_token }} },
+    };
+    var loaded: Loaded = .init(&m, .{});
+    defer loaded.deinit();
+    try loaded.expectRefusals(&.{});
+    try loaded.expectRefused(&.{&.{false}});
+}
+
+test "compile: an opaque-token client whose alg no key has fails the load under either setting" {
+    // It signs nothing, but its alg is held to the provider's keys all the same.
+    const m: model.Model = .{
+        .services = &.{.{ .name = "s", .operations = &.{op("o", ok(&plain))} }},
+        .identity = .{ .keys = &.{}, .clients = &.{.{ .id = "opaque", .secret = "x", .token = .opaque_token, .alg = .HS256 }} },
+    };
+    for ([_]Options{ .{ .on_unsupported = .refuse_model }, .{ .on_unsupported = .refuse_operation } }) |options| {
+        var loaded: Loaded = .init(&m, options);
+        defer loaded.deinit();
+        try loaded.expectModelRefused();
+        try loaded.expectRefusals(&.{.{ .service = null, .operation = null, .pointer = "/identity/clients/0/alg", .reason = .no_key_for_alg, .name = "HS256" }});
+    }
+}
+
 test "compile: the report outlives the model, and the next load replaces it" {
     const gpa = testing.allocator;
     const service_name = try gpa.dupe(u8, "pets");
@@ -1342,74 +1256,6 @@ test "compile: with no Diagnostics, nothing is kept and nothing leaks" {
     var compiled = try compile(testing.allocator, &m, .{ .on_unsupported = .refuse_operation }, null);
     defer compiled.deinit(testing.allocator);
     try testing.expectEqualDeep(@as([]const []const bool, &.{&.{ true, false }}), compiled.refused);
-}
-
-test "Refusal.format: one line, with names written as JSON strings" {
-    try testing.expectFmt(
-        \\service "pets", operation "getPet", /services/0/operations/0/parameters/0/schema: unsupported keyword "not"
-    , "{f}", .{Refusal{
-        .service = "pets",
-        .operation = "getPet",
-        .pointer = "/services/0/operations/0/parameters/0/schema",
-        .reason = .unsupported_keyword,
-        .name = "not",
-    }});
-    try testing.expectFmt(
-        \\service "a\"b", /services/0/security_schemes/1/kind/other: unsupported security scheme kind "mutual\nTLS"
-    , "{f}", .{Refusal{
-        .service = "a\"b",
-        .operation = null,
-        .pointer = "/services/0/security_schemes/1/kind/other",
-        .reason = .unsupported_scheme_kind,
-        .name = "mutual\nTLS",
-    }});
-    // A line that refuses nothing says so; without the tail it would read as a refusal.
-    try testing.expectFmt(
-        \\service "s", /services/0/security_schemes/0/kind/other: unsupported security scheme kind "mutualTLS", named by no requirement, refuses nothing
-    , "{f}", .{Refusal{
-        .service = "s",
-        .operation = null,
-        .pointer = "/services/0/security_schemes/0/kind/other",
-        .reason = .unsupported_scheme_kind_unused,
-        .name = "mutualTLS",
-    }});
-    // Each reason's own words: a line printed with another reason's would send its reader to the
-    // wrong fault.
-    try testing.expectFmt(
-        \\service "s", operation "o", /services/0/operations/0/security/0/0/scheme: no security scheme named "key"
-    , "{f}", .{Refusal{ .service = "s", .operation = "o", .pointer = "/services/0/operations/0/security/0/0/scheme", .reason = .unknown_scheme, .name = "key" }});
-    try testing.expectFmt(
-        \\service "s", /services/0/security_schemes/1/name: security scheme name used twice "auth"
-    , "{f}", .{Refusal{ .service = "s", .operation = null, .pointer = "/services/0/security_schemes/1/name", .reason = .duplicate_scheme_name, .name = "auth" }});
-    try testing.expectFmt(
-        \\service "pets", /services/1/name: service name used twice "pets"
-    , "{f}", .{Refusal{ .service = "pets", .operation = null, .pointer = "/services/1/name", .reason = .duplicate_service_name, .name = "pets" }});
-    // A line in no service starts at its pointer.
-    try testing.expectFmt(
-        \\/identity/clients/2/alg: no key of the identity provider has alg "HS256"
-    , "{f}", .{Refusal{ .service = null, .operation = null, .pointer = "/identity/clients/2/alg", .reason = .no_key_for_alg, .name = "HS256" }});
-    // Invalid UTF-8 is printed as U+FFFD inside the string, never as an array of bytes; valid
-    // multi-byte sequences are kept. Each byte outside a valid sequence is one U+FFFD: a lead
-    // byte with no continuation, and each byte of an encoded surrogate.
-    try testing.expectFmt("service \"s\u{FFFD}\", operation \"\u{FFFD}\u{FFFD}\", /services/0/operations/0/id: operation id used twice \"\u{FFFD}\u{FFFD}\u{FFFD}é\"", "{f}", .{Refusal{ .service = "s\xff", .operation = "\xc3\xe9", .pointer = "/services/0/operations/0/id", .reason = .duplicate_operation_id, .name = "\xed\xa0\x80é" }});
-}
-
-test "Diagnostics.format: one line each, then the count of lines past the bound" {
-    const line: Refusal = .{ .service = "s", .operation = "o", .pointer = "/services/0/operations/0/id", .reason = .duplicate_operation_id, .name = "o" };
-    // Without the last line a reader would take the listed lines for the whole report. The bound
-    // printed is the one the report was built with.
-    try testing.expectFmt(
-        \\service "s", operation "o", /services/0/operations/0/id: operation id used twice "o"
-        \\service "s", operation "o", /services/0/operations/0/id: operation id used twice "o"
-        \\3 more not listed: the report keeps at most 4096 bytes
-        \\
-    , "{f}", .{Diagnostics{ .report = &.{ line, line }, .unlisted = 3, .report_max = 4096 }});
-    // And with nothing past the bound, no count line.
-    try testing.expectFmt(
-        \\service "s", operation "o", /services/0/operations/0/id: operation id used twice "o"
-        \\
-    , "{f}", .{Diagnostics{ .report = &.{line} }});
-    try testing.expectFmt("", "{f}", .{Diagnostics{}});
 }
 
 test "compile: the report lists lines until the next would pass its bound, and counts the rest" {

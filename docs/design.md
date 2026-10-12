@@ -299,8 +299,11 @@ nothing`.
 either setting, like a service name used twice: clients are the test's own configuration, not part
 of an API it imports, so there is nothing to serve around one that is wrong. Its line names no
 service and no operation; its pointer is `/identity/clients/<i>/alg`, and it comes after every
-service's lines. A client whose `alg` is null takes the provider's first key and is not checked
-here.
+service's lines. A client whose `alg` is null takes the provider's first key, so a JWT client with a
+null `alg` on a provider that holds no key has nothing to sign with: it fails the load the same
+way, with the reason `.no_signing_key` and its line naming the client's id. An opaque-token client
+signs nothing, so a null `alg` needs no key; one whose `alg` is set is still refused when no key
+has that `alg`.
 
 **The report is bounded.** It keeps at most 1 MiB of memory, each line's text and its record (3,
 bounds); past that, lines are counted, not listed. The count is in `Diagnostics.unlisted`, and the

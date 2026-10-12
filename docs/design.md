@@ -584,16 +584,46 @@ no credentials gets 401 whatever its body.
 On a request that passed every stage the mock picks the response:
 
 1. A matching fault rule, if any (3, fault injection).
-2. Otherwise the success response: the lowest declared 2xx status; else a `2XX` range, answered as
+2. Otherwise the response the client asked for with a `Prefer` header (below), if it asked.
+3. Otherwise the success response: the lowest declared 2xx status; else a `2XX` range, answered as
    200; else `default`, answered as 200. An operation with none of these is refused at load.
-3. Status and content must agree, or the model is refused at load. A status mock answers with is
+4. Status and content must agree, or the model is refused at load. A status mock answers with is
    200 to 599: an informational status is never a final answer, so a declared `1XX` response or a
    1xx fault status is refused at load or at `faults.add`. A 204, 205 or 304 response declares no
    content. A response with no content (those three, or no declared media type) is sent without a
    body and needs no negotiation. Otherwise the media type is the first declared one the
    `Accept` header allows (`*/*` and `type/*` honoured, `q=0` excluded); none allowed is 406.
-4. The body: the first named example; else the schema's `examples`, then `default`; else a value
-   generated from the schema (4.3). Declared response headers are produced the same way.
+5. The body: the example `Prefer` named, if any; else the first named example; else the schema's
+   `examples`, then `default`; else a value generated from the schema (4.3). Declared response
+   headers are produced the same way.
+
+**Choosing a response with `Prefer`.** A client such as a person on an API page, or curl in a
+script, can ask for a response other than success, without code. It does so with the `Prefer`
+request header (RFC 7240), using the names Prism uses. mock parses the header as RFC 7240 §2 does:
+preferences separated by commas, each a token with an optional value, and parameters after `;`
+ignored. It acts on two preferences:
+- `code=<status>` picks the operation's declared response for that status, the way 4.4 picks one:
+  the exact code, else its range (`4XX`), else `default`. The status must be three digits from 200
+  to 599.
+- `example=<name>` picks that named example from the chosen response's media type. Without
+  `code`, that is the success response.
+
+Every other preference, such as `return=minimal`, `respond-async` or `wait`, is ignored, as RFC
+7240 §2 allows. If a preference appears twice, only the first counts (RFC 7240 §2).
+
+What `Prefer` never does:
+- **It never skips a stage.** The Host check, routing, authentication and validation run first, so
+  `Prefer: code=200` cannot get a request past a missing token or an invalid body.
+- **It never escapes the send-time validation or `Accept` negotiation.**
+- **It never overrides a fault rule.** A test's fault comes first.
+
+An honoured preference is echoed in `Preference-Applied` (RFC 7240 §3), for example
+`Preference-Applied: code=404`, and the record entry notes it. A `code` or `example` that names
+nothing the operation declares, or a `code` value that is not a status from 200 to 599, is refused.
+The answer is 400 with mock's own problem document, of type `preference-unsatisfiable`, which lists
+the declared statuses and example names. It is never the operation's declared 400, because the
+mistake is in the request to the mock, not in the request to the API. An ignored preference never
+silently turns into a success.
 
 **Every value sent is validated against its schema first**, whatever its source: example,
 `default`, or generated, body or header. Examples and defaults are also validated when the model is
@@ -720,8 +750,8 @@ pub const Outcome = union(enum) {
 
 A comptime check fails the build if a variant lacks either function. Adding a scheme is adding a
 variant; nothing else changes. A tagged union rather than a run-time interface, because every scheme
-lives in this library: there is no second implementer outside it to design for. Whether users
-should be able to plug in their own scheme is an open question (section 10).
+lives in this library: there is no second implementer outside it to design for. Letting users plug
+in their own scheme is a future addition (section 6).
 
 `oauth2` and `openIdConnect` schemes in a model are **checked as bearer tokens with scopes**. For a
 resource server the flow that produced a token does not matter, only whether the token is valid and
@@ -794,8 +824,10 @@ nothing and keeps the code safe to copy.
   For Ed25519 mock uses `Signature.verify` (`ed25519.zig:275`), which std documents as the
   cofactored check (`:270`); RFC 8032 §5.1.7 permits it as well as the strict one (`verifyStrict`,
   `:292`). The Wycheproof run (section 8) records which way each edge case falls. Each key carries
-  exactly one `alg` name; an Ed25519 key is configured as `EdDSA` (the default, which most libraries
-  still expect) or as `Ed25519` (the RFC 9864 name, which deprecates `EdDSA`).
+  exactly one `alg` name. An Ed25519 key is configured as `Ed25519`, the RFC 9864 name that
+  deprecates `EdDSA`, which is the default. It can also be configured as `EdDSA`, for clients whose
+  libraries know only the older name. The two names sign the same bytes and differ only in the
+  header's `alg`.
 
   RFC 9068 requires RS256 of conforming authorization and resource servers. Until RSA signing lands
   (6), mock's JWT access tokens follow RFC 9068's format but not that requirement.
@@ -835,9 +867,9 @@ RFC 8725. Each step refuses with its own reason, which goes into the 401 and the
 9. **Claims** (RFC 7519 §4.1, RFC 9068 §2.2): `iss`, `exp`, `aud`, `sub`, `client_id`, `iat` and
    `jti` must be present, with the right types: strings, and `aud` a string or an array of strings.
    `iss` equals the provider's issuer exactly; `aud` contains the service's audience exactly
-   (RFC 8725 §3.9); `exp` is in the future; `nbf`, if present, is not. `exp`, `nbf` and `iat` must
-   be JSON numbers (RFC 7519 §2 NumericDate); strings are refused. Clock leeway defaults to zero and
-   can be set.
+   (RFC 8725 §3.9); `exp` is in the future and `nbf`, if present, is not, both by the identity
+   clock (5.7). `exp`, `nbf` and `iat` must be JSON numbers (RFC 7519 §2 NumericDate); strings are
+   refused. Clock leeway defaults to zero and can be set.
 10. **Revocation.** A `jti` in the revoked set is refused.
 11. **Scopes** from the space-separated `scope` claim (RFC 9068 §2.2.3) are checked against the
     requirement.
@@ -897,8 +929,8 @@ RFC 6749 §4.4, on the provider's own listener at `/token`:
 - RFC 6749 requires TLS on the token endpoint. The first slice serves it over plain HTTP on
   loopback, a deliberate test-only deviation until the TLS server lands (6).
 
-It is a module of its own on top of the issuer. Deferring it removes that module and its listener;
-`idp.issue` still mints tokens in code.
+It is a module of its own on top of the issuer, and it is in the first slice: a client under test
+fetches its token the way it would in production. `idp.issue` also mints tokens in code.
 
 ### 5.6 What the provider exposes
 
@@ -908,6 +940,38 @@ It is a module of its own on top of the issuer. Deferring it removes that module
 - `idp.hmacSecret(kid)`: an HS256 key is a shared secret, so a server under test that verifies HS256
   needs it, and gets it only by asking for it in code.
 - `idp.revoke(jti)` (an unknown `jti` is `error.UnknownToken`), `idp.tokenUrl()`.
+- `idp.clock`: the identity clock (5.7).
+
+### 5.7 The identity clock
+
+Every time the identity provider reads comes from one clock:
+- `iat`, `nbf` and `exp` when it issues a token;
+- `expires_in` at the token endpoint;
+- the `exp` and `nbf` checks when it verifies a JWT;
+- expiry of an opaque token;
+- the issue and expiry times in the record's token entries.
+
+A test can move that clock, so it can make a token expire without waiting for it.
+
+- `Options.clock` is `.real` by default: the system's real-time clock plus an offset that starts at
+  zero. `.{ .manual = t }` instead freezes the clock at `t` seconds since the Unix epoch, and it
+  then moves only when the test moves it. Every `iat` is then exact, so a test can compare whole
+  tokens.
+- `idp.clock.advance(seconds)` adds to the offset (`.real`) or to the frozen time (`.manual`). The
+  number may be negative, so a test can step back to check `not_yet_valid`. `idp.clock.set(t)`
+  makes `now()` return `t` from then on, keeping the clock's mode. `idp.clock.now()` reads it.
+- A move that would leave the clock before the epoch, or after 253402300799 (the last second of
+  year 9999), is refused with `error.ClockOutOfRange`, and the clock is unchanged. That bound keeps
+  every `exp` mock writes inside the range of a JSON number that clients read exactly.
+- `init` refuses a `.manual` start outside that range with the same error.
+- The mode is fixed at `init`, and the clock's state is one atomic word: the offset or the frozen
+  time. So a test thread may move the clock while requests are being served. Each request reads it
+  once, when it issues or verifies a token, and uses that reading throughout.
+- The clock is kept across a swap, like the provider's keys.
+
+Only identity times follow it. Socket timeouts, the idle and blocked-write sweeper, fault delays,
+request durations and the request entries' times stay on real time. Moving the identity clock can
+therefore never stall or speed up the server itself.
 
 ## 6. Staging
 
@@ -923,6 +987,7 @@ Each item lands **when a conformance test needs it**, not before. Each needs:
 | Mutual TLS (RFC 8705) | The TLS server, plus a small X.509 issuer to make client certificates. std's `lib/std/crypto/Certificate.zig` parses (`:422`) and verifies (`:551`) but does not build certificates. std does encode DER (`std.crypto.codecs.asn1.der`, `lib/std/crypto/codecs/asn1/der.zig:19`), so the issuer is a certificate builder on top of it. |
 | SASL for the brokers: PLAIN (RFC 4616), SCRAM-SHA-256 (RFC 7677) and SCRAM-SHA-512 (RFC 5802 mechanism), OAUTHBEARER (RFC 7628) | The broker it runs in. SCRAM uses std's PBKDF2 (`lib/std/crypto/pbkdf2.zig`) and HMAC; OAUTHBEARER reuses the bearer verifier. |
 | SAML 2.0 SSO and WS-Security for SOAP | An XML parser (std has none), exclusive XML canonicalization (W3C xml-exc-c14n), XML-DSig, RSA signing (above) and the X.509 issuer (above). In memory, good enough for an API client or service to work against; not an enterprise IdP. |
+| Custom auth schemes | A run-time interface beside the scheme union, so a user can plug in code for a scheme OpenAPI cannot describe, such as a signed request (the whole request signed with a shared secret, the signature in a header). Such schemes reach mock today as API-key headers, which the first set already checks. A future addition, made when a user needs it. |
 | Protocols, in order | HTTP; then WebSocket (RFC 6455, on mock's own HTTP framing; the handshake needs only std's SHA-1 and base64, and mock adds the Host and Origin checks and bounded frames); MQTT 3.1.1, then 5.0; AMQP 0-9-1; Kafka; SOAP 1.1 and 1.2 (the XML parser above); later GraphQL and gRPC (gRPC needs HTTP/2, which std does not serve). |
 
 The README's "HTTP/1.1, plain or over TLS" depends on the TLS server row.
@@ -951,8 +1016,8 @@ where they came from, and `NOTICE` lists them.
 **Borrowed code meets the same bar as ours:** the same review, the same tests, the same planted
 defects. A borrowed file is not trusted because it is popular.
 
-Code that Spirefy's own maintainers wrote for other Spirefy projects may be moved in; its copyright
-holder licenses it under Apache-2.0 as it is added, and it is reviewed like new code.
+mock takes no code from its maintainers' closed-source projects. Code that is not borrowed under
+the policy above is written fresh in this repository.
 
 ### Borrowing candidates
 
@@ -1064,7 +1129,10 @@ and Zig tests only: no Python anywhere in the build, the tests or the tooling.
   (`uniqueItems` with `1` and `1.0`, objects in a different member order).
 - **step** (`step crypto jwt verify --key <public JWK> --iss <issuer> --aud <audience>`), for the
   ES256 and EdDSA tokens the mock issues, each verified with its own key's public JWK file (one key
-  per file, not the set). HS256 tokens are not given to step, since no public key verifies them;
+  per file, not the set). Ed25519 keys are checked under the `EdDSA` name, which step knows. The
+  default `Ed25519` name changes only the header's `alg`, and mock's own test checks that header
+  against RFC 9864. Whether step accepts the newer name has not been checked. HS256 tokens are not
+  given to step, since no public key verifies them;
   openssl checks those. Opaque tokens are not JWTs and go to neither. A good token must verify.
   Of the defective ones, step is expected to reject
   `expired`, `not_yet_valid`, `wrong_issuer`, `wrong_audience`, `bad_signature`, `untrusted_key` and
@@ -1127,6 +1195,11 @@ entry point), not inside a helper, except where a row says why it cannot be.
 | `deinit` takes the lifecycle lock again through `stop` | A started mock passed to `deinit` without a `stop` first must return within the test's time limit. The limit is enforced by a watchdog outside the call, never by the blocked call itself. |
 | A cancelled lock acquisition treated as taken | A `stop` holds the lifecycle lock, blocked on a test hook, and a `swapModel` waiting for the lock is cancelled. The `swapModel` must return `error.Canceled`, and the old model must still serve. A second lifecycle call made meanwhile must stay blocked until the `stop` returns, which shows the lock was never released by the cancelled call. The hook is released independently of the cancelled call. |
 | Cleanup that stops at a cancellation | Cancel the task that calls `stop` on a running mock with open connections, both while it waits for the lock and while it shuts sockets down. `stop` must still return with every socket in the live-connection table shut down and every task awaited. The plant removes the cancel protection, and the test then sees a socket left open or a task left running. |
+| The verifier reads the real clock instead of the identity clock | Issue a one-hour token, `idp.clock.advance(3601)`, and present it: it must be refused as `expired`. The plant makes the verifier read the real clock, and the test then sees 200. A `.manual` clock frozen at `t` must issue a token whose `iat` is exactly `t`. |
+| A clock move leaves the range | `advance` past year 9999, or `set(-1)`, must return `error.ClockOutOfRange` and leave `now()` unchanged. |
+| `Prefer` ignored | `curl -H 'Prefer: code=404'` on an operation that declares a 404 must get that response, with `Preference-Applied: code=404`. The plant ignores the header, and the test then sees 200. |
+| `Prefer` read too loosely | `Prefer: return=minimal` alone must change nothing. `Prefer: code=418` on an operation with no `4XX` or `default` must get 400 of type `preference-unsatisfiable`, not a success and not the operation's declared 400. |
+| `Prefer` applied before authentication | `Prefer: code=200` without credentials on a secured operation must still get 401. The plant chooses the response before authentication runs. |
 | A value is sent without the final validation | A unit test that hands the send boundary a value its schema forbids must get 500. The plant removes that check; the test then sees a 200. |
 | Equality by source text (`[1, 1.0]` passes `uniqueItems`) | The JSON-Schema-Test-Suite `uniqueItems` cases. |
 
@@ -1239,29 +1312,27 @@ pub const Options = struct {
     on_unsupported: enum { refuse_model, refuse_operation } = .refuse_model,
     validation_errors: enum { declared_or_problem, problem_document } = .declared_or_problem,
     clock_leeway_s: u32 = 0,
+    clock: union(enum) { real, manual: i64 } = .real,  // the identity clock (5.7)
     limits: Limits = .{},
 };
 ```
 
 `Diagnostics` carries the load report, because a Zig error carries no payload.
 
-## 10. Open questions for the maintainer
+## 10. Decisions by the maintainer
 
-1. **Deferring the token endpoint.** Ship client credentials in the first slice (5.5) or defer it
-   and mint tokens only in code?
-2. **Declared error shapes.** A request refused at validation is answered with the operation's own
-   declared response for that status, chosen as 4.4 says, and with mock's problem document only when
-   the operation declares none. Is that the right default, or should mock's own document be the
-   default and the declared shape the option?
-3. **Custom schemes.** Should users be able to add their own auth scheme (for example a signed-request
-   scheme), which would need a run-time interface beside the tagged union?
-4. **A test clock.** Token times come from the real clock. Is a settable clock worth adding, so a test
-   can make a token expire without waiting?
-5. **Services in a swap.** A swap cannot add or remove a service. Is that acceptable for Spirefy's
-   use, where a user may add a server while a mock is running?
-6. **`EdDSA` or `Ed25519` by default** for Ed25519 keys (5.2).
-7. **Choosing a response from the client.** Prism lets a client pick a response with a `Prefer`
-   header. mock offers only the in-code `declared` fault. Is the header wanted?
+The design's open questions, as the maintainer answered them on 2026-10-12:
+
+1. **The client-credentials token endpoint ships in the first slice** (5.5).
+2. **A refused request is answered with the API's own declared error shape by default**, and with
+   mock's problem document only when the operation declares none (4.4). A mock that answers in the
+   API's shape lets that shape be tested, and fixed where it is wrong. `.problem_document` remains
+   an option.
+3. **Custom auth schemes are left out for now** and recorded as a future addition (6).
+4. **There is a settable test clock**, so a test never waits for a token to expire (5.7).
+5. **A swap that adds or removes a service is refused** (2).
+6. **`Ed25519` is the default name** for Ed25519 keys, with `EdDSA` as an option (5.2).
+7. **A client may choose a response with `Prefer`** (4.2).
 
 ## 11. Prior art
 

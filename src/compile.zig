@@ -299,7 +299,7 @@ const Checker = struct {
     refused_any: bool = false,
     model_wide: bool = false,
 
-    // Names sorted for lookup; see `Name`. The last three are reused for each service.
+    // Names sorted for lookup; see `Name`. `schemes` and `ids` are refilled for each service.
     service_names: std.ArrayList(Name) = .empty,
     schemes: std.ArrayList(Name) = .empty,
     ids: std.ArrayList(Name) = .empty,
@@ -800,8 +800,8 @@ test "compile: a schema reached by two paths is named by the first in field orde
         .{ .name = "a", .schema = &refused_not },
         .{ .name = "b", .schema = &refused_not },
     } };
-    // `items` comes before `one_of` among `Schema`'s fields, though the walk pushes `one_of`
-    // first.
+    // `items` comes before `one_of` among `Schema`'s fields, so the walk reaches the shared
+    // schema through `items` first.
     const by_items: model.Schema = .{ .items = &refused_not, .one_of = &.{&refused_not} };
     const m: model.Model = .{ .services = &.{.{ .name = "s", .operations = &.{
         op("properties", ok(&by_properties)),
@@ -1514,8 +1514,10 @@ const Within = struct {
 };
 
 /// Loads `m` with every allocation, the result's included, taken from `buffer`, so that a load
-/// whose memory is not bounded by the size of the model fails with `error.OutOfMemory` instead
-/// of passing. Logs how long the load took and where it left the buffer's end, at `.info`: the
+/// that takes more than the buffer fails with `error.OutOfMemory` instead of passing. A test sizes
+/// the buffer with room for its fixture under this code and far below what the earlier code took;
+/// that shows the load stays within the budget for that fixture, not a bound for every model,
+/// which rests on the code's own invariants. Logs how long the load took and where it left the buffer's end, at `.info`: the
 /// test runner shows that only when `std.testing.log_level` is raised, because any test output
 /// on stderr makes `zig build test` print its command as failed though every test passed.
 fn loadWithin(buffer: []u8, m: *const model.Model, options: Options, what: []const u8) !Within {
@@ -1599,7 +1601,8 @@ test "compile: schemas that share one child slice take memory for the schemas, n
     for (1..schemas.len) |i| try pointer.print(gpa, "/properties/{d}/schema", .{i});
 
     // The load ends about 0.8 MiB into the buffer, measured: a fixed buffer's allocator frees
-    // only its last allocation, so each array that grows leaves its old copies behind.
+    // only its last allocation, so an array that grows when it is not the last one is copied and
+    // leaves its old block behind.
     const buffer = try gpa.alloc(u8, 4 << 20);
     defer gpa.free(buffer);
     const loaded = try loadWithin(buffer, &m, .{ .on_unsupported = .refuse_operation }, "4,000,000 edges between 2,000 schemas");

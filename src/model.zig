@@ -19,7 +19,8 @@ pub const Model = struct {
 
 /// One API, served on a listener of its own.
 pub const Service = struct {
-    /// Unique within the model: the key for the service's port, its record entries and swaps.
+    /// Unique within the model: the key for the service's port, its record entries and swaps. A
+    /// name used twice fails the load whatever `Options.on_unsupported` says.
     name: []const u8,
     /// The JWT `aud` this service accepts. Null means `name`.
     audience: ?[]const u8 = null,
@@ -30,7 +31,7 @@ pub const Service = struct {
 };
 
 pub const Operation = struct {
-    /// Unique within the service.
+    /// Unique within the service. An id used twice refuses both operations.
     id: []const u8,
     method: std.http.Method,
     /// A path template, such as "/pets/{petId}".
@@ -144,9 +145,14 @@ pub const Schema = struct {
     /// The name of every keyword the source schema had that has no field above.
     ///
     /// Pure annotations are accepted: `title`, `description`, `$comment`, `deprecated`,
-    /// `externalDocs`, the OpenAPI `discriminator` (it does not change how `oneOf` validates), and
-    /// any name starting `x-`. Every other name is refused when the model is loaded, so that a
-    /// keyword such as `not` is never served as if it were absent.
+    /// `externalDocs`, any name starting `x-`, OpenAPI 3.0's `example` and `xml`, the OpenAPI
+    /// `discriminator` (it does not change how `oneOf` validates), the identifiers and containers
+    /// `$schema`, `$id`, `$anchor`, `$dynamicAnchor`, `$recursiveAnchor`, `$vocabulary`, `$defs`
+    /// and `definitions`, and `contentMediaType`, `contentEncoding` and `contentSchema`. Every
+    /// other name is refused when the model is loaded, so that a keyword such as `not` is never
+    /// served as if it were absent. That includes `$ref`, `$dynamicRef` and `$recursiveRef`: an
+    /// adapter resolves a reference into a pointer, so one listed here was not resolved, and
+    /// ignoring it would validate against nothing.
     other_keywords: []const []const u8 = &.{},
 };
 
@@ -185,6 +191,8 @@ pub const Additional = union(enum) {
 };
 
 pub const SecurityScheme = struct {
+    /// Unique within the service. A name used twice is a refusal, and refuses the operations
+    /// whose requirements name it.
     name: []const u8,
     kind: union(enum) {
         api_key: struct { in: enum { header, query, cookie }, name: []const u8 },
@@ -195,7 +203,8 @@ pub const SecurityScheme = struct {
         /// Checked as a bearer token.
         openid_connect,
         /// A scheme mock does not implement, by its source name, such as "mutualTLS" or
-        /// "http digest". A model that declares one is refused when it is loaded.
+        /// "http digest". It is refused only where an operation's requirements name it; one that
+        /// no operation's requirements name is reported, and refuses nothing.
         other: []const u8,
     },
 };

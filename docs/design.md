@@ -63,7 +63,7 @@ pub const Model = struct {
 };
 
 pub const Service = struct {
-    name: []const u8,                 // unique; the key for ports, records and swaps
+    name: []const u8,                 // unique (used twice, the load fails); the key for ports, records and swaps
     audience: ?[]const u8 = null,     // JWT `aud` this service accepts; defaults to `name`
     security_schemes: []const SecurityScheme = &.{},
     security: []const Requirement = &.{},   // default for operations; empty = none
@@ -71,7 +71,7 @@ pub const Service = struct {
 };
 
 pub const Operation = struct {
-    id: []const u8,                   // unique within the service
+    id: []const u8,                   // unique within the service (used twice, both are refused)
     method: std.http.Method,          // lib/std/http.zig:23
     path: []const u8,                 // template: "/pets/{petId}"
     parameters: []const Parameter = &.{},
@@ -149,11 +149,26 @@ pub const Schema = struct {
 ```
 
 An adapter maps the keywords mock has fields for and puts the name of **every other keyword** into
-`other_keywords`. mock knows which of those are pure annotations (`title`, `description`,
-`$comment`, `deprecated`, `externalDocs`, `x-` extensions, and the OpenAPI `discriminator`, which
-does not change `oneOf` validation) and refuses the rest. Without this field an adapter would drop
-`not` or `if` silently and mock would answer as if the keyword were absent, which is exactly the
-wrong answer the bar forbids.
+`other_keywords`. mock accepts the names that are pure annotations, which change nothing mock does,
+and refuses the rest. The annotations are:
+
+- `title`, `description`, `$comment`, `deprecated`, `externalDocs`, `x-` extensions (the prefix
+  compared with case, as OpenAPI's field names are), OpenAPI 3.0's `example` and `xml`, and the
+  OpenAPI `discriminator`, which does not change `oneOf` validation;
+- the identifiers and containers `$schema`, `$id`, `$anchor`, `$dynamicAnchor`,
+  `$recursiveAnchor`, `$vocabulary`, `$defs` and `definitions`. They name a schema, a dialect or a
+  place to keep schemas, and they matter only to the adapter: a reference reaches its target as a
+  pointer, so a schema kept under `$defs` is checked where a pointer reaches it;
+- `contentMediaType`, `contentEncoding` and `contentSchema`, which JSON Schema 2020-12 makes
+  annotations.
+
+The references `$ref`, `$dynamicRef` and `$recursiveRef` stay refused. An adapter resolves a
+reference into a `*const Schema`; one left in `other_keywords` means the adapter did not resolve it,
+and ignoring it would validate against nothing. `nullable` stays refused too: an adapter maps it
+into `types` (4.4), and one left unmapped, if ignored, would refuse a valid null.
+
+Without this field an adapter would drop `not` or `if` silently and mock would answer as if the
+keyword were absent, which is exactly the wrong answer the bar forbids.
 
 Schemas reference each other by `*const Schema`, so a recursive schema is a pointer cycle. mock
 copies the graph once, keeping cycles, when it loads the model.
@@ -162,14 +177,14 @@ Security and identity types:
 
 ```zig
 pub const SecurityScheme = struct {
-    name: []const u8,
+    name: []const u8,                 // unique within the service (used twice, a refusal)
     kind: union(enum) {
         api_key: struct { in: enum { header, query, cookie }, name: []const u8 },
         http_basic,
         http_bearer: struct { format: enum { any, jwt, opaque_token } = .any },
         oauth2: struct { scopes: []const []const u8 = &.{} },   // any flow; see 5.1
         openid_connect,                                       // checked as bearer; see 5.1
-        other: []const u8,            // e.g. "mutualTLS", "http digest": refused at load
+        other: []const u8,            // e.g. "mutualTLS", "http digest": refused where required (below)
     },
 };
 
@@ -237,9 +252,12 @@ const model: mock.Model = .{ .services = &.{.{
 
 Loading a model compiles it: every name is resolved, every path template parsed, every schema
 checked against the subset, every example and `default` validated against its schema, and the
-route table built. The result is an immutable compiled model. Loading produces a **load report**: one line for every
-refusal, each naming where (service, operation, JSON pointer into the schema) and what (keyword,
-parameter style, media type, scheme).
+route table built. The result is an immutable compiled model. Loading produces a **load report**:
+one line for every refusal, and one for each unsupported scheme that no operation needs (below),
+each naming where and what. Where is the service, the operation, and a JSON pointer (RFC 6901) from
+the model's root through the model types' field names and slice indices, such as
+`/services/0/operations/2/parameters/0/schema/items`; a schema reached by more than one path is
+named by the first path the check took. What is the keyword, parameter style, media type or scheme.
 
 What happens to a refusal is set by `Options.on_unsupported`:
 
@@ -251,6 +269,30 @@ What happens to a refusal is set by `Options.on_unsupported`:
 
 An example or `default` that does not validate against its own schema is a refusal like any other:
 mock will not hand a client data the description says is impossible.
+
+**Names.** A name used twice, or one that names nothing, is a fault in the model:
+
+- A service name used twice fails the load under either setting, because a service is addressed by
+  name: its port, its record entries and a swap all find it that way.
+- An operation id used twice refuses both operations, because the record and fault rules name an
+  operation by its id, so neither could be told from the other.
+- A security scheme name used twice is a refusal, and so is a requirement naming a scheme the
+  service does not declare. Under `.refuse_operation` each refuses the operations whose
+  requirements name it; under `.refuse_model` each fails the load even when no operation needs it.
+
+**Unsupported schemes.** A scheme of a kind mock does not implement (`kind = .other`) is not a
+fault in the model, so it is refused only where an operation's requirements name it: its own, or
+its service's when its own `security` is null. Under `.refuse_model` that fails the load; under
+`.refuse_operation` it refuses those operations. A declared one that no operation's requirements
+name still gets a line, so the reader of an imported API sees what mock would not check, but that
+line refuses nothing and fails no load under either setting: no request is checked against the
+scheme, so it cannot make an answer wrong. The line says so twice over: its reason is
+`.unsupported_scheme_kind_unused`, and its printed form ends `named by no requirement, refuses
+nothing`.
+
+**The report is bounded.** It keeps at most 1 MiB of text (3, bounds); past that, lines are
+counted, not listed. The count is in `Diagnostics.unlisted`, and the printed report ends with it.
+The bound changes what is listed, never the load's outcome.
 
 **Swapping.** `swapModel(new)` compiles the new model first. If it is refused, the old model keeps
 serving and the call returns the error with its report. If it compiles, one pointer is replaced
@@ -478,6 +520,7 @@ Every limit has a default, can be set in `Options.limits`, and fails visibly.
 | Fault rules / one fault's body | 256 / 1 MiB | `faults.add` returns `error.TooManyRules` or `error.FaultTooLarge`. |
 | Generation: depth / nodes / one string / one response / work | 8 / 10,000 / 4 KiB / 1 MiB / 1,000,000 steps | See 4.3. A schema whose minimum (`minItems`, `minLength`, required recursion) cannot fit is refused at load; one that overruns at run time gets 500. Nothing is clamped below what the schema requires. |
 | Compiled model | 64 MiB | The load is refused. |
+| Load report text (the service names, operation ids, pointers and names its lines hold) | 1 MiB | The lines are listed in the order the checks meet them until the next would pass the bound; it and every line after it are counted, not listed. `Diagnostics.unlisted` holds the count, and the printed report ends with it. The load's outcome is the one it would have without the bound. This also caps what a long chain of refused schemas, each with a longer pointer, can make the report hold. |
 
 ### The seed
 
@@ -730,7 +773,8 @@ step consumes one level of the instance, and the instance depth is bounded.
 **What the first slice refuses**, at load, by name: `pattern` and `patternProperties` (std has no
 regular-expression engine; this is the first follow-up), `not`, `if`/`then`/`else`,
 `dependentRequired`, `dependentSchemas`, `prefixItems`, `contains`, `propertyNames`,
-`unevaluatedProperties`, `unevaluatedItems`, `$dynamicRef`, and a non-integer `multipleOf`.
+`unevaluatedProperties`, `unevaluatedItems`, `$dynamicRef`, a `$ref` or `$recursiveRef` an adapter
+left unresolved (2), and a non-integer `multipleOf`.
 
 **Parameters.** Path `simple`; query `form` with `explode` true or false, for primitives and arrays;
 header `simple`; cookie `form`. Objects in parameters (`deepObject`, exploded objects) and the
@@ -1313,6 +1357,7 @@ const mock = @import("mock");
 test "client sends a valid token" {
     const io = std.testing.io;
     var diag: mock.Diagnostics = .{};
+    defer diag.deinit(std.testing.allocator);
     const m = try mock.Mock.init(std.testing.allocator, io, &model, .{ .seed = 7 }, &diag);
     defer m.deinit();
     try m.start();

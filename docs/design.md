@@ -1,8 +1,9 @@
 # mock: design
 
-Status: **proposal**, for review before any code is written. The README states the scope; this
-document says how the first slice is built and what comes after it. Where this document and the
-README disagree, that is a defect in one of them.
+Status: **accepted**; the first slice is being built to it, in stages. The README states the
+scope; this document says how the first slice is built and what comes after it. Where this
+document and the README disagree, that is a defect in one of them. Where the code shows the design
+is wrong, the design is corrected first, in the same change.
 
 Standard-library citations are `lib/std/<path>:<line>` in the Zig 0.16.0 release, read when this
 document was written.
@@ -63,7 +64,7 @@ pub const Model = struct {
 };
 
 pub const Service = struct {
-    name: []const u8,                 // unique (used twice, the load fails); the key for ports, records and swaps
+    name: []const u8,                 // unique, or the load fails; keys ports, records, swaps
     audience: ?[]const u8 = null,     // JWT `aud` this service accepts; defaults to `name`
     security_schemes: []const SecurityScheme = &.{},
     security: []const Requirement = &.{},   // default for operations; empty = none
@@ -154,7 +155,9 @@ and refuses the rest. The annotations are:
 
 - `title`, `description`, `$comment`, `deprecated`, `externalDocs`, `x-` extensions (the prefix
   compared with case, as OpenAPI's field names are), OpenAPI 3.0's `example` and `xml`, and the
-  OpenAPI `discriminator`, which does not change `oneOf` validation;
+  OpenAPI `discriminator`, which does not change `oneOf` validation. An adapter should map 3.0's
+  `example` into `examples`, where it is validated and served; listed here instead, its value
+  never reaches mock, so it is neither checked nor served;
 - the identifiers and containers `$schema`, `$id`, `$anchor`, `$dynamicAnchor`,
   `$recursiveAnchor`, `$vocabulary`, `$defs` and `definitions`. They name a schema, a dialect or a
   place to keep schemas, and they matter only to the adapter: a reference reaches its target as a

@@ -633,12 +633,16 @@ wrong reason. The other preferences are ignored as the RFC requires.
 Because `Prefer` can change the response, every response this stage sends carries a `Vary` field
 that lists `Prefer`, whether or not the request had a `Prefer` header (RFC 7240 §2 requires that),
 so that a cache never answers an ordinary request with a response a preference chose. The
-`preference-unsatisfiable` refusal carries it too. The field also lists `Accept` whenever the
-response's media type was chosen by negotiation (RFC 9110 §12.5.5). If the operation declares a
-`Vary` response header, mock produces its value as for any declared header, then adds `Prefer` and
-`Accept` to that one field where they are missing, keeping its members; a declared `*` already
-covers both and is left alone. The added members are mock's own, like `Preference-Applied`, and are
-not checked against the declared header's schema.
+`preference-unsatisfiable` refusal carries it too. The field also lists `Accept` whenever step 4
+negotiated, whichever way it came out: when it chose a media type the `Accept` header allowed, and
+when it answered 406 because none was allowed (RFC 9110 §12.5.5). A response with no content skips
+negotiation, so its field lists `Prefer` without `Accept`. If the operation declares a `Vary`
+response header, mock produces its value as for any declared header, then adds its own members to
+that one field where they are missing, keeping the declared ones; a declared `*` already covers
+them and is left alone. The value checked against the declared header's schema is the merged one,
+which is the value sent, both at load for examples and defaults and at send time (below). So a
+declaration that cannot hold mock's members, such as a `const` of `Origin`, is refused at load
+when its example or default shows it, and is otherwise answered 500 at send time.
 
 **Every value sent is validated against its schema first**, whatever its source: example,
 `default`, or generated, body or header. Examples and defaults are also validated when the model is
@@ -1176,7 +1180,8 @@ and Zig tests only: no Python anywhere in the build, the tests or the tooling.
 - **openssl**, a second signature check over the token's signing input: for HS256 the script
   computes the MAC with `openssl dgst -sha256 -mac HMAC -macopt hexkey:<key>` and compares it with
   the token's signature; for Ed25519, under either name, it runs `openssl pkeyutl -verify -rawin`
-  with the public key as PEM. Both must agree with mock on good and tampered tokens.
+  with `-pubin` and the public key as PEM, over the signing input's exact bytes. Both must agree
+  with mock on good and tampered tokens.
 - **Published vectors**, as Zig tests at the JWS layer:
   - RFC 7515 Appendix A.1 (HS256) and A.3 (ES256) must verify; A.5, an unsecured JWS, must be
     refused under mock's `alg: none` rule;
@@ -1228,12 +1233,13 @@ entry point), not inside a helper, except where a row says why it cannot be.
 | A cancelled lock acquisition treated as taken | A `stop` holds the lifecycle lock, blocked on a test hook, and a `swapModel` waiting for the lock is cancelled. The `swapModel` must return `error.Canceled`, and the old model must still serve. A second lifecycle call made meanwhile must stay blocked until the `stop` returns, which shows the lock was never released by the cancelled call. The hook is released independently of the cancelled call. |
 | Cleanup that stops at a cancellation | Cancel the task that calls `stop` on a running mock with open connections, both while it waits for the lock and while it shuts sockets down. `stop` must still return with every socket in the live-connection table shut down and every task awaited. The plant removes the cancel protection, and the test then sees a socket left open or a task left running. |
 | The verifier reads the real clock instead of the identity clock | Issue a one-hour token, `idp.clock.advance(3601)`, and present it: it must be refused as `expired`. The plant makes the verifier read the real clock, and the test then sees 200. A `.manual` clock frozen at `t` must issue a token whose `iat` is exactly `t`. |
-| A clock move leaves the range | On a `.manual` clock, so that nothing else moves it, `advance` past year 9999, or `set(-1)`, must return `error.ClockOutOfRange` and leave `now()` unchanged. The plant removes the range check, and `now()` then reads the out-of-range time. |
+| A clock move leaves the range | On a `.manual` clock, so that nothing else moves it, `advance` past year 9999, or `set(-1)`, must return `error.ClockOutOfRange` and leave `now()` unchanged. The plant removes the move's range check, and the move then succeeds. |
 | A `.real` clock read past the bound is used | On a test `Io` whose real-time clock the test steps, `set` the identity clock to the last second of year 9999 and step real time by two seconds: a request to the token endpoint must get 500 of type `clock-out-of-range`, and `idp.issue` must return `error.ClockOutOfRange`. The plant removes the read check, and the test then sees 200 and a token whose `iat` is past the bound. |
 | `Prefer` ignored | `curl -H 'Prefer: code=404'` on an operation that declares a 404 must get that response, with `Preference-Applied: code=404`. The plant ignores the header, and the test then sees 200. |
 | `Prefer` read too loosely | `Prefer: return=minimal` alone must change nothing. `Prefer: code=418` on an operation with no `4XX` or `default` must get 400 of type `preference-unsatisfiable`, not a success and not the operation's declared 400. |
 | `Prefer` applied before authentication | `Prefer: code=200` without credentials on a secured operation must still get 401. The plant sends the preferred response as soon as `Prefer` is read, before authentication runs, and the test then sees 200. |
-| `Vary: Prefer` missing | A request with no `Prefer` header must get a response whose `Vary` lists `Prefer`. On an operation that declares a `Vary: Origin` response header, the response must carry one `Vary` field listing `Origin` and `Prefer`. The plant drops mock's members, and a cache keyed without `Prefer` would then serve a preferred 404 to an ordinary request. |
+| `Vary: Prefer` missing | A request with no `Prefer` header must get a response whose `Vary` lists `Prefer`. On an operation that declares a `Vary: Origin` response header, the response must carry one `Vary` field listing `Origin` and `Prefer`. A request whose `Accept` allows none of the declared media types must get 406 with `Vary` listing `Accept`. The plant drops mock's members, and a cache keyed without `Prefer` would then serve a preferred 404 to an ordinary request. |
+| A declared `Vary` validated before mock's members are added | An operation that declares a `Vary` response header whose schema is a `const` of `Origin`, with the example `Origin`, must be refused at load. The plant validates the value before the merge, and the model then loads and sends `Origin, Prefer`, which its own schema forbids. |
 | A value is sent without the final validation | A unit test that hands the send boundary a value its schema forbids must get 500. The plant removes that check; the test then sees a 200. |
 | Equality by source text (`[1, 1.0]` passes `uniqueItems`) | The JSON-Schema-Test-Suite `uniqueItems` cases. |
 

@@ -19,7 +19,7 @@ a chain is closed until a later pass reads the change.
 - Model: `gpt-6.1-sol`, reasoning effort `max`.
 - Verdict: **REWORK** — "correct the HTTP wrapper, ownership and resource contracts, credential
   validity rules, and mutation-test gaps before implementation."
-- Fixed in the commit that follows this record.
+- Fixed in `4fafcd5`, the commit that adds this record.
 
 | # | Sev. | Finding (short) | Disposition and evidence | Change |
 |---|---|---|---|---|
@@ -81,7 +81,7 @@ reviews with the fixes.
 - Verdict: **REWORK** — "malformed chunk acceptance, body-authentication ordering, incomplete error
   contracts, and remaining ownership/resource/lifecycle gaps still prevent the promised defensive
   guarantees."
-- Fixed in the commit that follows this record.
+- Fixed in `67e152b`, the commit that adds this record.
 
 Pass 1's findings: F1-F3, F6, F9-F11, F13, F16-F18, F20-F22, F24, F28-F30 closed. The residue the
 pass named in the others, each confirmed by reading the design at `4fafcd5`:
@@ -145,7 +145,7 @@ From CHECKED CLEAN: std's drain before responding is conditional on keeping the 
 - Model: `gpt-6.1-sol`, reasoning effort `max`.
 - Verdict: **REWORK** — "the stated lifecycle contract can deadlock during cleanup, and the
   record-state and error-response guarantees still need correction."
-- Fixed in the commit that follows this record. That fix delta had its own pass, pass 4.
+- Fixed in `5afe804`, the commit that adds this record. That fix delta had its own pass, pass 4.
 
 Pass 2's items: F4, F8, F14-F16, F19, F23, F25-F27, F31, F32 and F34-F40 closed. F5, F7 and F33
 closed in part; what remained is F42, F41 and F44 below.
@@ -177,7 +177,7 @@ says what the survey found (7). The real-socket blocked-writer run, survey count
   - resolve lifecycle cancellation;
   - remove the contradiction about the body of a too-complex request;
   - correct the F43 disposition.
-- **Fixed in:** the commit that follows this record, which gets its own pass.
+- **Fixed in:** `6e7b01d`, the commit that adds this record, which gets its own pass.
 
 Pass 3's items:
 - F42, F43 and F44 are closed, as are the three survey wording items.
@@ -202,7 +202,7 @@ the time limit is enforced outside the blocked call. Section 8 now says so.
   - complete cancellation handling;
   - settle when the swap candidate is compiled;
   - keep every case of 4.4's response choice.
-- **Fixed in:** the commit that follows this record, which gets its own pass.
+- **Fixed in:** `4baee22`, the commit that adds this record, which gets its own pass.
 
 Pass 4's items:
 - F47 is closed.
@@ -225,7 +225,7 @@ Pass 4's items:
 - **Model:** `gpt-6.1-sol`, reasoning effort `max`.
 - **Verdict:** **ACCEPT WITH CHANGES**. The previous findings are closed. The pass asked for one
   correction, to a blanket guarantee about cancelled task results.
-- **Fixed in:** the commit that follows this record, which gets its own pass.
+- **Fixed in:** `1b6ae19`, the commit that adds this record, which gets its own pass.
 
 Pass 5's items: the rest of F45, the rest of F46, and F48 are all closed.
 
@@ -254,7 +254,7 @@ Pass 5's items: the rest of F45, the rest of F46, and F48 are all closed.
 - **Verdict:** **ACCEPT WITH CHANGES**. The clock and signing contracts needed correcting, strict
   `Prefer` handling needed to be marked as a deviation, `Vary` was missing, and one plant could not
   turn red.
-- **Fixed in:** the commit that follows this record, which gets its own pass.
+- **Fixed in:** `a5a33fe`, the commit that adds this record, which gets its own pass.
 
 RFC 7240 §2 was read for F52 and F53: a server that "does not recognize or is unable to comply
 with particular preference tokens … MUST ignore those tokens and continue processing instead of
@@ -280,3 +280,29 @@ authentication" was ballast as written: choosing a response early can still leav
 so the plant might never turn the test red. It now sends the preferred response before
 authentication runs. The range plant now uses a `.manual` clock, so that real time cannot move
 `now()` under the "unchanged" assertion.
+
+## Pass 9
+
+- **Reviewed:** the fix delta `777a3eb..a5a33fe` (pass 8's fixes), read-only, with pass 8's
+  findings and their dispositions.
+- **Model:** `gpt-6.1-sol`, reasoning effort `max`.
+- **Verdict:** **ACCEPT WITH CHANGES**. The merged `Vary` value had to be validated, the 406 had
+  to list `Accept`, and the record had to name its fix commits correctly.
+- **Fixed in:** the commit that adds this record, which gets its own pass.
+
+Pass 8's items:
+- F50, F51, F52, F54 and F55 are closed, and so are both plant notes.
+- F53 is closed in part: see F56 and F57.
+- The pass confirmed that `openssl pkeyutl -verify -rawin` checks an Ed25519 signature over the
+  signing-input bytes without reading the JOSE `alg`. It noted that the invocation needs `-pubin`
+  as well as the key, input and signature arguments, and section 8 now names it.
+
+| # | Sev. | Finding (short) | Disposition and evidence | Change |
+|---|---|---|---|---|
+| F56 | MED | Adding mock's members to a declared `Vary` can send a value its own schema forbids (a `const` of `Origin` becomes `Origin, Prefer`), and the sentence exempting the added members contradicted "every value sent is validated against its schema first" | CONFIRMED-BY-READING: both sentences stood in 4.2 at `a5a33fe`, and a schema constrains the whole header value | The exemption is withdrawn. The merged value, which is the value sent, is the one validated, at load for examples and defaults and at send time; a declaration that cannot hold mock's members is refused at load when its example or default shows it, and otherwise answered 500 (4.2). A plant validates before the merge (8). |
+| F57 | LOW | The `Accept` condition named only a successful choice of media type, so the 406, which also depends on `Accept`, need not list it | CONFIRMED-BY-READING: 4.2 step 4 answers 406 when no declared type is allowed, and the condition read "chosen by negotiation" | `Accept` is listed whenever step 4 negotiated, whichever way it came out, the 406 included; a response with no content skips negotiation and lists `Prefer` only (4.2). The `Vary` plant gains a 406 case (8). |
+| F58 | LOW | Pass 8's "Fixed in: the commit that follows this record" is wrong: the record and its fixes are in the same commit, `a5a33fe` | CONFIRMED-BY-READING, and the class is wider than the finding: `git show --stat` shows that every fix commit from `4fafcd5` to `a5a33fe` adds its pass's record together with its fixes, so passes 1 to 6 and 8 all said the same wrong thing | Each of those seven records now names its commit and says it is the commit that adds the record. |
+
+**BALLAST:** the pass judged all four new or rewritten plants armor. It noted that the range plant's
+narrative was wrong while the read check stays in place, since `now()` would then return the error
+rather than the out-of-range time; the plant now says the move succeeds.

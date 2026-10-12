@@ -259,7 +259,8 @@ holds a reference; the last release frees the old model), and every request that
 sees the new one. A swap may change anything except the set of service names, because services own
 listeners and ports; a swap that adds or removes a service is refused (`error.ServiceSetChanged`).
 The identity provider keeps its keys and its token store across a swap. So that tokens issued
-before a swap stay valid after it, a swap may not add or remove the identity provider or change its
+before a swap stay valid after it (valid, not authorized: what a token may do follows the new
+model's requirements), a swap may not add or remove the identity provider or change its
 issuer, its keys, or any service's audience (`error.IdentityChanged`); users, clients and API keys
 come from the new model. A client whose `alg` names no key the provider holds is refused at load,
 in a swap as at the start.
@@ -288,8 +289,9 @@ four of its behaviours do not fit a mock that must never answer wrongly or hang:
   (`lib/std/http.zig:457-459`), so reading it waits for the client to close.
 - `Content-Length` is parsed with `std.fmt.parseInt` (`lib/std/http/Server.zig:154`), which accepts
   a leading `+` and ignores `_` (`lib/std/fmt.zig:329`, `:442`).
-- `respond` drains an unread request body before it writes the status line (`:350`, `:618-633`),
-  so a 413 for an oversized upload is sent only after the whole upload has been read.
+- When it means to keep the connection alive, `respond` drains an unread request body before it
+  writes the status line (`:348-350`, `:618-633`), so a 413 for an oversized upload is sent only
+  after the whole upload has been read.
 - Starting to read a body invalidates the strings in the parsed head (`:594`).
 
 mock's parser, bounded by the limits in this section:
@@ -299,24 +301,40 @@ mock's parser, bounded by the limits in this section:
   operation is still `std.http.Method` (`lib/std/http.zig:23`), a closed set of nine; a `CONNECT`
   operation is refused at load, since mock does not tunnel.
 - The head is copied into memory the connection owns before anything else reads it.
-- Body framing follows RFC 9112 §6.3 and ignores the method: `Transfer-Encoding: chunked` (decoded
-  with `std.http.ChunkParser`, `lib/std/http/ChunkParser.zig:35`), else `Content-Length`, else no
-  body. `Content-Length` is decimal digits only. Both headers at once, a repeated `Content-Length`
-  or any transfer coding other than `chunked` is refused (400, or 501 for an unknown coding,
-  RFC 9112 §6.1) and the connection is closed.
+- Body framing follows RFC 9112 §6.3 and ignores the method: `Transfer-Encoding: chunked`, else
+  `Content-Length`, else no body. `Content-Length` is decimal digits only. Both headers at once, a
+  repeated `Content-Length` or any transfer coding other than `chunked` is refused (400, or 501 for
+  an unknown coding, RFC 9112 §6.1) and the connection is closed.
+- The chunked decoder is mock's own, strict to RFC 9112 §7.1. `std.http.ChunkParser` was
+  considered and is not used: it takes any ASCII letter as a size digit
+  (`lib/std/http/ChunkParser.zig:55-57`, so `G` reads as 16), treats any other byte as the start of
+  an extension (`:65-68`), and skips extension bytes without checking them (`:79-85`). In mock's
+  decoder a chunk size is one or more hex digits, and the body is refused with 413 as soon as the
+  running total would pass the body limit, before any arithmetic can overflow. A chunk extension
+  must match the `chunk-ext` grammar (§7.1.1) and is then ignored. The trailer section (§7.1.2) is
+  parsed with the header grammar and discarded, never merged into the headers. Chunk-size lines,
+  extensions and trailers count against the request-head limit, so leading zeros or long
+  extensions cannot make framing unbounded. Any other breach is 400, and the connection is closed.
 - `Expect: 100-continue` is answered with 100 only after the head has passed the Host check,
   routing, authentication and the size limit. If any of those fails, the final response is sent
-  instead.
+  instead. Every scheme in the first slice reads its credential from the head (5.2), so this order
+  never waits on the body. The token endpoint is the exception, because a client may authenticate
+  in its form body (5.5): there, 100 follows the Host check, routing, the media type and the size
+  limit, and the client is authenticated after the bounded form is read.
 - Whenever mock answers without reading the whole body, it sends `Connection: close` and closes. A
   connection is kept alive only after its request body has been read to its end.
 
-Responses are written by mock too: a status line, then headers. `Content-Length` is sent on every
-response except 1xx, 204 and 304 (RFC 9110 §8.6). A HEAD response carries the headers the GET
-response would have, including its `Content-Length`, and no body. Header names must be tokens and
-values must not contain CR, LF or NUL; a declared response header, example or fault that breaks
-this is refused when it is loaded or added, not when it is sent. `Content-Length`,
-`Transfer-Encoding` and `Connection` are reserved to mock: a model that declares them as response
-headers is refused at load.
+Responses are written by mock too: a status line, then each header as one `name: value` line
+ending in CRLF, never folded, then the body. `Content-Length` is sent on every response except 1xx,
+204 and 304 (RFC 9110 §8.6); a 205 carries `Content-Length: 0` (RFC 9110 §15.3.6). A HEAD response
+carries the headers the GET response would have, including its `Content-Length`, and no body.
+Header names must be tokens, and values must match the `field-value` grammar of RFC 9110 §5.5:
+visible characters and obs-text, with spaces and tabs only between them, and no CR, LF, NUL or
+other control character. A declared response header, example or fault that breaks this is refused
+when it is loaded or added. A generated header value is checked by the same rule before it is sent;
+one that fails is a 500, like any value that fails its final check (4.2). `Content-Length`,
+`Transfer-Encoding`, `Connection` and `Content-Encoding` are reserved to mock, which does not encode
+bodies: a model that declares any of them as a response header is refused at load.
 
 ### The Host check, against DNS rebinding
 
@@ -325,8 +343,12 @@ talk to a loopback server under that name. Every listener therefore checks the r
 before anything else:
 
 - Accepted by default: `127.0.0.1:<port>`, `localhost:<port>` and `[::1]:<port>`, with the
-  listener's own port; the host part is compared without regard to case. `Options.allowed_hosts`
-  adds names; `.any` turns the check off and must be written out.
+  listener's own port. The authority is parsed before it is compared, not compared as text: an IPv6
+  literal as a 16-byte address, so `[0:0:0:0:0:0:0:1]` is `[::1]`; an IPv4 literal only in RFC 3986
+  §3.2.2 dotted-decimal form, so `2130706433` and `0x7f.0.0.1` are names, which are not allowed; a
+  name without regard to case, so `LOCALHOST` matches and `localhost.` does not; and the port as a
+  decimal number, so `04711` is port 4711. A missing port means 80. A port above 65535 is invalid
+  syntax. `Options.allowed_hosts` adds names; `.any` turns the check off and must be written out.
 - A missing Host header, more than one, or one with invalid syntax is answered 400, as RFC 9112
   §3.2 requires for HTTP/1.1. mock applies the same rule to HTTP/1.0, since the check cannot run
   without Host.
@@ -404,6 +426,10 @@ closed and possibly reused by the OS.
   then cancels and awaits the connection group (`Group.cancel`, `lib/std/Io.zig:1298`). Shutting
   the sockets down is what bounds `stop`: a task blocked writing to a client that never reads fails
   its write instead of holding `stop` forever. Section 8 plants exactly that client.
+- `start`, `stop`, `swapModel` and `deinit` take one lifecycle lock, because `Future.cancel` and
+  `Group.cancel` are not thread-safe (`lib/std/Io.zig:1191`, `:1298`): a second `stop` on another
+  thread waits for the first, then returns. No task of the mock takes that lock, so `stop` can
+  await tasks while holding it.
 - `stop` is idempotent; `deinit` calls it. A stopped mock keeps its record until `deinit`, and no
   task of a mock outlives its `stop`.
 
@@ -422,10 +448,10 @@ Every limit has a default, can be set in `Options.limits`, and fails visibly.
 | Record entries | 10,000 | Later requests are still answered and **counted**, but not stored. Every query except `stats()` then returns `error.RecordOverflow` until `clear()`. A truncated record cannot be read by accident. |
 | Body bytes kept per record entry | 64 KiB | The prefix is kept, with the full length and `body_truncated = true`. |
 | Errors listed in a validation problem | 32 | The list ends and the document says `"truncated": true`. |
-| Tokens held (issued, with their metadata) | 10,000 | `issue` returns `error.TokenStoreFull`; the token endpoint answers 503. Revocation applies only to held tokens, so the revoked set is bounded by the same limit. |
-| Size of a presented token | 8 KiB | Refused with reason `too_large`. |
-| Fault rules | 256 | `faults.add` returns `error.TooManyRules`. |
-| Generation: depth / nodes / one string / one response | 8 / 10,000 / 4 KiB / 1 MiB | See 4.3. A schema whose minimum (`minItems`, `minLength`, required recursion) cannot fit is refused at load; one that overruns at run time gets 500. Nothing is clamped below what the schema requires. |
+| Tokens held (issued, with their metadata) | 10,000 tokens / 4 MiB in all | `issue` returns `error.TokenStoreFull`; the token endpoint answers 503. Revocation applies only to held tokens, so the revoked set is bounded by the same limit. |
+| Size of a token, issued or presented | 8 KiB | `issue` returns `error.TokenTooLarge` and the token endpoint answers 500; a presented token is refused with reason `too_large`. |
+| Fault rules / one fault's body | 256 / 1 MiB | `faults.add` returns `error.TooManyRules` or `error.FaultTooLarge`. |
+| Generation: depth / nodes / one string / one response / work | 8 / 10,000 / 4 KiB / 1 MiB / 1,000,000 steps | See 4.3. A schema whose minimum (`minItems`, `minLength`, required recursion) cannot fit is refused at load; one that overruns at run time gets 500. Nothing is clamped below what the schema requires. |
 | Compiled model | 64 MiB | The load is refused. |
 
 ### The seed
@@ -449,8 +475,9 @@ Keys are **not** derived from the seed. Each mock makes fresh keys from `Io.rand
 (`lib/std/crypto/ecdsa.zig:318`, `lib/std/crypto/25519/ed25519.zig:319`). It does not use the
 `KeyPair.generate` functions, because they draw from `Io.random` (`ecdsa.zig:329`,
 `ed25519.zig:339`), which falls back to a seed made from the process id, the time and an address
-when secure entropy is unavailable (`lib/std/Io/Threaded.zig:16958`, `:16967`). If `randomSecure`
-fails, `init` fails with `error.EntropyUnavailable`.
+when secure entropy is unavailable (`lib/std/Io/Threaded.zig:16958`, `:16967`). `randomSecure` can
+fail with `error.EntropyUnavailable` or `error.Canceled` (`lib/std/Io.zig:2472`), and `init` returns
+either as it came, so a cancelled `init` is not reported as missing entropy.
 
 ### The record
 
@@ -466,12 +493,20 @@ Every request, and every credential the identity provider issues, is recorded:
 Every string in the record is the record's own copy, model-derived names included, so a swap or a
 caller freeing its model cannot leave the record pointing at freed memory.
 
+The token store is not the record. It copies every string it keeps, as the record does, and
+`clear()` does not touch it.
+
 **Ordering guarantee.** An entry is published as `pending` as soon as its request head is accepted,
-before any byte of any response, 100 Continue included. It becomes `answered`, with its status,
-before the first byte of the final response is written, and `completed`, `dropped` or `failed`, with
-its duration, after. A test that has received any part of a response therefore always finds the
-entry, with at least its status. `clear()` removes every entry, in-flight ones included; a later
-update to a removed entry is discarded.
+before any byte of any response, 100 Continue included; a pending entry has no status yet. It
+becomes `answered`, with its status, before the first byte of the final response is written, and
+`completed`, `dropped` or `failed`, with its duration, after. A connection refused before a head is
+accepted (a malformed or oversized head, the connection bound, a failed spawn) gets an entry too,
+published as `answered` with its status, its reason and whatever of the head was read, before its
+response is written. So a test that has received any byte of a final response finds the entry with
+its status, and a test that has received only a 100 finds it `pending`. Two things end the promise,
+both visibly: past the record bound, entries are counted, not stored, and queries return
+`error.RecordOverflow` (Bounds); and `clear()` removes every entry, in-flight ones included, after
+which an update to a removed entry is discarded.
 
 Queries (`requests`, `tokens`, `count`, each with a filter) copy their results into the caller's
 allocator, so nothing a test holds can be freed under it by a later `clear`. `stats()` returns the
@@ -489,7 +524,9 @@ matches, or to every match until removed:
   so `stop` is never held up by it;
 - `drop`: close the connection before any response, or part-way through the body.
 
-A rule's headers are checked when it is added (no CR, LF or NUL, no reserved names). Every applied
+A rule is checked when it is added: its status is 200 to 599, a 204, 205 or 304 rule has no body,
+its body is within its bound (Bounds), and its headers follow the field-value grammar with no
+reserved names (the response writer, above). Every applied
 fault is in the request's record entry. The identity provider's token endpoint is an operation like
 any other, so forcing it to answer `invalid_grant` is a `status` fault; no separate hook system is
 needed.
@@ -523,9 +560,12 @@ On a request that passed every stage the mock picks the response:
 1. A matching fault rule, if any (3, fault injection).
 2. Otherwise the success response: the lowest declared 2xx status; else a `2XX` range, answered as
    200; else `default`, answered as 200. An operation with none of these is refused at load.
-3. A response with no content (204, 304, or no declared media type) is sent without a body and
-   needs no negotiation. Otherwise the media type is the first declared one the `Accept` header
-   allows (`*/*` and `type/*` honoured, `q=0` excluded); none allowed is 406.
+3. Status and content must agree, or the model is refused at load. A status mock answers with is
+   200 to 599: an informational status is never a final answer, so a declared `1XX` response or a
+   1xx fault status is refused at load or at `faults.add`. A 204, 205 or 304 response declares no
+   content. A response with no content (those three, or no declared media type) is sent without a
+   body and needs no negotiation. Otherwise the media type is the first declared one the
+   `Accept` header allows (`*/*` and `type/*` honoured, `q=0` excluded); none allowed is 406.
 4. The body: the first named example; else the schema's `examples`, then `default`; else a value
    generated from the schema (4.3). Declared response headers are produced the same way.
 
@@ -565,10 +605,12 @@ Refused at load: required properties that recurse with no way to stop within the
 
 Path, query, header and cookie parameters, then `Content-Type`, then the body.
 
-**Error responses.** By default a validation failure is answered with the operation's own declared
-response for that status (exactly 400 or 422, else its `4XX` range), from its example or generated
-from its schema, so that a client's error decoder sees the shape the API promises. When the
-operation declares neither, the answer is an `application/problem+json` document (RFC 9457) with a
+**Error responses.** By default a request this stage refuses is answered with the operation's own
+declared response for the refusal's status (400, 413 for a request too complex to check, 415, or
+422, below), found the way the OpenAPI Responses Object orders them: the exact code, else its
+`4XX` range, else `default`. Its body comes from its example or is generated from its schema, so
+that a client's error decoder sees the shape the API promises. When the operation declares none
+of the three, the answer is an `application/problem+json` document (RFC 9457) with a
 `type` tag URI (RFC 4151) such as `tag:spirefy.io,2026:mock/request-invalid`, a `title`, the
 `status`, the `operation`, and an `errors` extension member listing each problem: where (`in` and a
 JSON pointer), which keyword, and a message. The problem list is in the record either way.
@@ -644,7 +686,7 @@ pub const Scheme = union(enum) {
 
 pub const Outcome = union(enum) {
     absent,                        // this scheme's credential is not in the request
-    malformed: []const u8,         // present but unreadable, or present twice
+    malformed: []const u8,         // the request's authentication syntax is broken (see below)
     granted: Principal,            // subject, client id, scopes, token jti
     refused: Refusal,              // readable but invalid: a reason enum plus detail
 };
@@ -662,21 +704,33 @@ the first slice; only *issuing* through that flow comes later (6), and a test ca
 directly meanwhile. This is the trap mock exists to avoid: a mock that accepts any
 `Authorization: Bearer <anything>` passes a client that sends garbage.
 
-**Evaluation.** For each requirement in order, check each scheme it names. The operation is allowed
-if one requirement has every scheme granted with every scope it lists. Otherwise, in this order:
+**Evaluation.** Every scheme the operation's requirements name is checked once. A requirement is
+satisfied when every scheme it names is granted with every scope it lists, and the operation is
+allowed when any requirement is satisfied. Otherwise the answer is decided from all the outcomes
+together, so every mix of credentials has one, a requirement met only in part included. The first
+rule that holds decides:
 
-- 400 with `error="invalid_request"` if a credential was malformed (bad base64, a header repeated,
-  the same token in both the header and the query) (RFC 6750 §3.1);
-- 401 if a credential was refused, with `error="invalid_token"` and an `error_description` naming the
-  reason for bearer (RFC 6750 §3);
-- 403 with `error="insufficient_scope"` (RFC 6750 §3.1) if a credential was valid but lacked a scope;
-- 401 if no credential was presented, with each scheme's challenge and **no** error code, as
-  RFC 6750 §3.1 asks when authentication information is absent.
+1. 400 with `error="invalid_request"` (RFC 6750 §3.1) if any credential is malformed. Malformed
+   means the request's authentication syntax is broken: a header repeated, the same credential in
+   two places (the header and the query, say), a Basic value that is not base64 or has no colon, a
+   Bearer value that is not `b64token` syntax (RFC 6750 §2.1). A Bearer value with the right syntax
+   that does not decode or parse as a JWT is **not** malformed: it is a refused token (5.3), since
+   RFC 6750 §3.1 gives `invalid_token` to a token that is "malformed, or invalid for other reasons".
+2. 401 with `error="invalid_token"` and an `error_description` naming the reason (RFC 6750 §3) if
+   any credential was refused.
+3. 403 with `error="insufficient_scope"` (RFC 6750 §3.1) if some requirement has every scheme
+   granted and lacks only scopes.
+4. 401 with each scheme's challenge and **no** error code otherwise: every requirement lacks at
+   least one credential. That includes a requirement for two API keys called with one valid key.
+   RFC 6750 §3.1 asks for no error code when authentication information is absent.
 
-Every 401 carries at least one challenge (RFC 9110 §15.5.2): `Basic realm="mock"` (RFC 7617 §2),
-`Bearer realm="mock"` (RFC 6750 §3). API keys have no registered scheme, so mock sends
-`ApiKey realm="mock", in="header", name="X-API-Key"` (with the scheme's own location and name),
-which is well-formed challenge syntax that clients may ignore. The body is a problem document naming
+Every 401 carries at least one challenge (RFC 9110 §15.5.2), one for each scheme the requirements
+name: `Basic realm="mock"` (RFC 7617 §2), `Bearer realm="mock"` (RFC 6750 §3). Parameter values are
+quoted strings with `"` and `\` escaped (RFC 9110 §11.2), and an `error_description` keeps to the
+characters RFC 6750 §3 allows. API keys have no registered scheme, so mock sends
+`ApiKey realm="mock", in="header", name="X-API-Key"` (with the scheme's own location and name). It
+is mock's own, well-formed challenge syntax that clients may ignore, not an interoperable scheme.
+The body is a problem document naming
 the reason. A production server would say less; a test double that hides the reason only slows the
 person debugging.
 
@@ -741,9 +795,9 @@ RFC 8725. Each step refuses with its own reason, which goes into the 401 and the
    as the HMAC secret. Unknown `kid`: refused.
 5. **`crit` is refused if present**, and so is a `b64` member whatever its value. RFC 7515 §4.1.11
    requires refusing a token whose `crit` lists an extension the recipient does not understand, and
-   mock understands none; `b64` (RFC 7797) is only meaningful under `crit`, and refusing it outright
-   leaves no reading in which a payload is signed unencoded. Presence is what is tested: a member
-   whose value is `null` counts as present.
+   mock understands none. Refusing `b64` (RFC 7797) outright is mock's own policy, narrower than
+   RFC 7797, which permits it under `crit`: it leaves no reading in which a payload is signed
+   unencoded. Presence is what is tested: a member whose value is `null` counts as present.
 6. **`jku`, `x5u`, `jwk` and `x5c` are never used** to find or fetch a key (RFC 8725 §3.10). Keys
    come only from the provider.
 7. **`typ`** must be `at+jwt` or `application/at+jwt`, compared without regard to case (RFC 9068 §4;
@@ -780,14 +834,16 @@ flipped bit from a key it does not hold.
 | `wrong_audience` | JWT | `aud` is a value no service accepts | `wrong_audience` |
 | `bad_signature` | JWT | one bit of the signature flipped | `signature_invalid` |
 | `untrusted_key` | JWT | signed by a key the provider does not hold, under a `kid` it does | `signature_invalid` |
-| `missing_scope` | JWT, opaque | one requested scope left out; needs at least one requested scope | `insufficient_scope` (403) |
+| `missing_scope` | JWT, opaque | one requested scope left out; needs at least one requested scope | `insufficient_scope` (403), on an operation whose requirement demands the left-out scope |
 | `revoked` | JWT, opaque | issued, then its `jti` revoked | `revoked` |
 | `alg_none` | JWT | unsigned, `alg: none` | `alg_none` |
 | `wrong_typ` | JWT | `typ: JWT` instead of `at+jwt` | `wrong_typ` |
 | `unknown_kid` | JWT | `kid` names no key | `unknown_kid` |
 
 Asking for a defect that does not apply (an opaque `alg_none`, a `missing_scope` with no scope) is an
-error, not a good token. A client configured with a `defect` gets tokens with that defect from the
+error, not a good token. A `missing_scope` token is wrong only where the left-out scope is required;
+on any other operation it is a good token, so a test presents it where that scope is demanded.
+A client configured with a `defect` gets tokens with that defect from the
 token endpoint, so a system that fetches its own token can be tested against a bad one. Defective
 tokens are recorded with their defect. They serve two kinds of test: a server under test that must
 refuse them (it verifies with the provider's keys, 5.6), and mock's own verifier, which must refuse
@@ -804,7 +860,8 @@ RFC 6749 §4.4, on the provider's own listener at `/token`:
   (`client_secret_post`), RFC 6749 §2.3.1. For Basic, the user-id and password are each
   form-urlencoded before base64, so mock splits first and form-decodes each part after: client
   `a:b` with secret `x+y` arrives as the Basic credentials of `a%3Ab:x%2By`. Both methods at once is
-  `invalid_request`.
+  `invalid_request`. Since the credentials may be in the body, `Expect: 100-continue` is answered
+  here before the client is authenticated (3).
 - Success (§5.1): `access_token`, `token_type: "Bearer"`, `expires_in`, `scope`, with
   `Cache-Control: no-store` and `Pragma: no-cache`. The requested scopes must be a subset of the
   client's; none requested means all of them.
@@ -832,7 +889,7 @@ Each item lands **when a conformance test needs it**, not before. Each needs:
 
 | Item | Needs |
 |---|---|
-| `pattern`, `patternProperties` | A regular-expression engine for the ECMA-262 dialect JSON Schema uses. std has none, and no ECMAScript-compatible engine exists in Zig (Borrowing candidates). Also generation of strings that match. |
+| `pattern`, `patternProperties` | A regular-expression engine for the ECMA-262 dialect JSON Schema uses. std has none, and the survey found no ECMAScript-compatible engine in Zig (Borrowing candidates). Also generation of strings that match. |
 | RS256, PS256 | RSA key generation and signing. std verifies only: `lib/std/crypto/Certificate.zig:945` has `rsa.PKCS1v1_5Signature.verify` (`:1125`) and `PSSSignature.verify` (`:962`), no signing and no key generation. Generating keys means prime generation on top of `lib/std/crypto/ff.zig`. |
 | Authorization code with PKCE (RFC 7636), refresh tokens (RFC 6749 §6), device code (RFC 8628), introspection (RFC 7662), revocation (RFC 7009) | Headless approval: an authorization request is approved as the test user the test picks. Client registration with redirect URIs. Mostly HTTP and the existing issuer. |
 | OpenID Connect: discovery, JWKS over HTTP, ID tokens, userinfo | The above, plus `nonce` and ID-token claims. |
@@ -878,10 +935,20 @@ verdicts.** Licenses come from the GitHub API and the head of each LICENSE file.
 the project declares it in `build.zig.zon` or CI; nothing was built. Test counts are counts of
 `test` declarations. Conformance claims are each project's own and were not reproduced.
 
-**The real check happens at borrow time.** Before anything is copied: pin the commit; read
-`LICENSE` and any `NOTICE` at that commit; record the URL, the commit and the license in our
-`NOTICE`; carry the file's own notice into its header with a line on what changed. Borrowed code then
-meets section 8 like our own.
+**The real check happens at borrow time.** Before anything is copied, at a pinned commit:
+
+- Read the terms that apply to each file we take: the root `LICENSE`, any license or `NOTICE` in
+  the module or directory that holds it, the file's own header, and the terms of any third-party
+  code or test vectors inside it. Repository metadata does not settle this.
+- Where the terms offer a choice (`Apache-2.0 OR ISC`), record the license we take it under.
+- Fulfil every condition those terms set, attribution conditions in a module's `NOTICE` included,
+  and ship the license texts they require.
+- Record the URL, the commit, the files and the license in our `NOTICE`; carry the file's own
+  notice into its header with a line on what changed; and carry an Apache-2.0 source's `NOTICE`
+  text into ours, as above.
+
+Borrowed code then meets section 8 like our own. The stars, contributor counts and test counts in
+the tables are context for choosing where to look, not reasons to borrow.
 
 Two facts shape every row:
 
@@ -897,7 +964,7 @@ Two facts shape every row:
 
 | Upstream | License | What we would adapt | Why | Caveat |
 |---|---|---|---|---|
-| karlseguin/http.zig, branch `zig-0.16.0` | MIT | Reference only: connection handling and limits | `std.http.Server` is enough to build on; this is a mature design to compare against | 50 contributors; we do not plan to copy it |
+| karlseguin/http.zig, branch `zig-0.16.0` | MIT | Reference only: connection handling and limits | mock writes its own framing (3); this is a mature design to compare its connection handling and limits against | 50 contributors; we do not plan to copy it |
 | zaxified/zig-libs `jwt` | MIT | JWS encoding and verification structure, RFC vectors | Its encoder takes `alg` from the key and never emits `alg: none`, as 5.3 requires; 158 tests | AI-written, unaudited; its vectors file carries a NOTICE condition; no JWK Set writer was seen in its root file |
 | ChristianPresley/zig-sdk, `src/mcp/auth/authorization_server.zig` | Apache-2.0 | The token endpoint's request parsing and error responses (5.5) | The only licensed Zig 0.16 authorization server found; 2,091 lines, 20 tests | Coupled to an MCP SDK; one contributor |
 | C2SP/wycheproof | Apache-2.0 | Test vectors (section 8) | Independent negative cases for ECDSA P-256, Ed25519 and HMAC | Vectors, not code |
@@ -920,7 +987,7 @@ The signature primitives are std's (5.2), so nothing is borrowed for them.
 | | techsaint/zig_iroh `acme/x509.zig` | Apache-2.0 | A DER writer and CSR, ECDSA | Fragment |
 | XML | ianprime0509/zig-xml | 0BSD | Parser | Seven contributors, a W3C xmlconf runner, fuzzing; no DTD support |
 | | zaxified/zig-libs `xml` | MIT | Namespace-aware parser that refuses DOCTYPE, never expands entities, and has limits | AI-written |
-| Exclusive C14N, XML-DSig | zaxified/zig-libs `xmldsig` | MIT | Canonicalization and verification | Verifies only; signing and XPath exist nowhere, so we write them |
+| Exclusive C14N, XML-DSig | zaxified/zig-libs `xmldsig` | MIT | Canonicalization and verification | Verifies only; the survey found no signing or XPath, so we expect to write them |
 | SAML | (ours) | | An identity provider | No Zig SAML IdP exists; zig-libs `saml` is service-provider side only |
 | SCRAM | securemessage/xmppd `lib/sasl/scram.zig` | BSD-2-Clause | Server and client, channel binding, SASLprep with NFC tables | SHA-1 and SHA-256 only; Zig 0.15.2+ per its README |
 | | meszmate/smtp.zig `src/auth/scram.zig` | MIT | SHA-256 with RFC 7677 vectors | |
@@ -931,8 +998,8 @@ The signature primitives are std's (5.2), so nothing is borrowed for them.
 | | electricalgorithm/protomq | MIT | Trie-based wildcard routing | Zig 0.15.2 |
 | Kafka | mattrobenolt/kafka-zig | Apache-2.0 | `src/testing/mock_broker.zig`, an in-process mock broker (ApiVersions, Metadata, Produce, SaslHandshake, SaslAuthenticate, SCRAM-SHA-512 server side); the codecs in `src/wire` | The closest thing to mock in Zig, for one protocol |
 | | kay-kewl/samsa | MIT | The approach: protocol structs generated from Kafka's JSON message schemas | Worth copying as a method |
-| AMQP 0-9-1 | malcolmstill/zig-amqp | BSD-3-Clause | The frame codec | Zig 0.13; no Zig broker exists, so the broker is ours |
-| `pattern` | zoptia0regex | Apache-2.0 | A linear-time regular-expression engine | RE2-class, not ECMAScript-compatible; no ECMAScript-compatible engine exists in Zig, so the dialect gap must be closed or refused by name |
+| AMQP 0-9-1 | malcolmstill/zig-amqp | BSD-3-Clause | The frame codec | Zig 0.13; the survey found no Zig broker, so the broker is ours |
+| `pattern` | zoptia0regex | Apache-2.0 | A linear-time regular-expression engine | RE2-class, not ECMAScript-compatible; the survey found no ECMAScript-compatible engine in Zig, so the dialect gap must be closed or refused by name |
 | HTTP/2, gRPC | zaxified/zig-libs `grpc`, `http`; Arwalk/zig-protobuf (tag `zig-0.16.0`, claims the protobuf conformance suite); hendriknielaender/http2.zig; zoxy-io/hpack; c4milo/colibri (h2spec 144 of 146) | MIT, MIT, MIT, MIT, Apache-2.0 | Held until gRPC is scheduled | |
 | GraphQL | none | | | No licensed Zig 0.16 validator or executor exists |
 | Deterministic tests | zaxified/zig-libs `simio` | MIT | A deterministic `std.Io` with virtual time, for testing timeouts and the sweeper | AI-written |
@@ -959,13 +1026,21 @@ and Zig tests only: no Python anywhere in the build, the tests or the tooling.
   compare statuses, headers and bodies with what the design says: routing and 405, the Host check
   (`curl -H 'Host: evil.example'` must get 421), framing refusals, Basic and API keys, and every
   defective token (5.4) presented to a protected operation, which must get 401 or 403 with the
-  matching reason. curl decides nothing about schemas; it only carries what mock answered.
+  matching reason. It also presents tokens mock never issued and so holds nothing about, made by the
+  script itself: a hand-encoded `alg: none` token, a token step signs with a key mock does not
+  hold, and a good token with one character changed. curl decides nothing about schemas; it only
+  carries what mock answered.
 - **JSON-Schema-Test-Suite** (MIT), as a Zig test: every case for a keyword mock supports must give
-  the suite's answer, through the same validator the server uses. Cases for refused keywords must be
-  refused at load. This is the independent check of the validator, including value equality
+  the suite's answer, through the same validator the server uses. Cases for refused keywords, and
+  for refused forms of a supported one (a non-integer `multipleOf`), must be refused at load and are
+  counted as such, not as passes. This is the independent check of the validator, including
+  value equality
   (`uniqueItems` with `1` and `1.0`, objects in a different member order).
-- **step** (`step crypto jwt verify --key <public JWK> --iss <issuer> --aud <audience>`), for tokens
-  the mock issues. A good token must verify. Of the defective ones, step is expected to reject
+- **step** (`step crypto jwt verify --key <public JWK> --iss <issuer> --aud <audience>`), for the
+  ES256 and EdDSA tokens the mock issues, each verified with its own key's public JWK file (one key
+  per file, not the set). HS256 tokens are not given to step, since no public key verifies them;
+  openssl checks those. Opaque tokens are not JWTs and go to neither. A good token must verify.
+  Of the defective ones, step is expected to reject
   `expired`, `not_yet_valid`, `wrong_issuer`, `wrong_audience`, `bad_signature`, `untrusted_key` and
   `alg_none`, and to accept `missing_scope`, `revoked`, `wrong_typ` and `unknown_kid`: it knows
   nothing of scopes or revocation, does not check `typ`, and with a key given directly does not look
@@ -984,12 +1059,14 @@ and Zig tests only: no Python anywhere in the build, the tests or the tooling.
   - RFC 7520 §4.4 (HS256). RFC 7518 defines the algorithms but publishes no JWS signature examples.
   - Wycheproof (Apache-2.0): the P-256 ECDSA vectors in IEEE P1363 form, which is exactly JWS's
     `R‖S`; the Ed25519 vectors; the HMAC-SHA-256 vectors. Every `valid` case must verify and every
-    `invalid` case must be refused. Cases Wycheproof marks `acceptable` are recorded with the result
-    std's cofactored Ed25519 check gives.
+    `invalid` case must be refused. Cases Wycheproof marks `acceptable` are pinned to the result
+    std's cofactored Ed25519 check gives, which is mock's policy (5.2), so a change in any of them
+    fails the test.
 
 The scripts drive a small example program (`examples/serve.zig`) that builds a fixture model,
-starts a mock, prints its ports, writes the public JWK Set, PEM copies of the public keys, the HS256
-secret and a token of every kind to an output directory, and stops when its standard input closes.
+starts a mock, prints its ports, writes the public JWK Set, each public key as its own JWK file and
+as PEM, the HS256 secret and a token of every kind to an output directory, and stops when its
+standard input closes.
 A missing tool fails the check with its name; it is never skipped silently.
 
 ### Plants
@@ -997,7 +1074,7 @@ A missing tool fails the check with its name; it is never skipped silently.
 A plant is a defect injected on purpose to show that a check can fail. Each check below names the
 plant it must turn red; a check never seen red is not trusted. Each plant changes one thing in an
 otherwise valid fixture, and is asserted at the public boundary (an HTTP response, or the verifier's
-entry point), not inside a helper.
+entry point), not inside a helper, except where a row says why it cannot be.
 
 | Plant | Must be caught by |
 |---|---|
@@ -1006,14 +1083,21 @@ entry point), not inside a helper.
 | The header's `alg` chooses the verification (an HS256 token keyed with the ES256 public key's bytes is accepted) | An alg-confusion unit test that builds exactly that token. |
 | `crit` or `b64` ignored | Tokens carrying `crit: ["x"]`, and `b64: false` without `crit`, must be refused. |
 | `exp` or `aud` not checked by the verifier | The `expired` and `wrong_audience` unit tests and curl cases. (step checks only the issuer side, so it cannot catch this plant.) |
-| An opaque lookup also grants a JWT, or ignores expiry or revocation | An `alg_none` JWT placed in the token store, and an expired and a revoked opaque token, each presented through the bearer entry point, must be refused. |
+| Shape dispatch removed, so a JWT-shaped bearer credential is looked up in the token store | An `alg_none` JWT placed in the token store as an opaque token, presented through the bearer entry point, must be refused. |
+| The opaque check ignores expiry or revocation | An expired and a revoked opaque token, presented through the bearer entry point, must be refused. |
+| The token store's kind check removed | A unit test at the store's lookup with a JWT-kind entry. This is the one plant asserted below the public boundary: while shape dispatch holds, no HTTP request reaches the kind check. The check stays as armor, with that argument written beside it in the code. |
+| A partly met requirement granted, or left without an answer | An operation requiring two API keys, called with one valid key: 401 with both challenges and no error code. |
+| A JWT that does not parse is answered 400 | A Bearer value of three base64url parts whose header is not JSON must get 401 `invalid_token`. |
+| A chunk size accepts a letter outside hex | A chunked request whose size line is `G` must get 400 and a closed connection. |
+| 100 Continue at the token endpoint waits for authentication | curl with `client_secret_post`, `Expect: 100-continue` and an expect timeout longer than the test's time limit must get its token within that limit. |
+| A declared `default` error shape ignored | An invalid body sent to an operation that declares only 200 and `default` must get the `default` shape. |
 | Routing ignores the method | `curl -X DELETE` on a GET-only path must get 405 with `Allow: GET, HEAD`; the router unit test. |
 | The most-literal rule reversed | `/pets/mine` must reach its own operation, not `/pets/{petId}`. |
 | The Host check disabled | `curl -H 'Host: evil.example'` must get 421; an absolute-form target naming `evil.example` must get 421 too. |
 | A GET's `Content-Length` body is not consumed | A GET with a body followed on the same connection by a second request: the second must be answered as itself, not parsed from the first one's body. |
 | The record drops entries past its bound silently | Fill the record to its bound plus one: the query must return `error.RecordOverflow`, not the first N entries. |
 | The connection bound not enforced | Hold the bound's number of connections open, each confirmed accepted by its `pending` record entry; one more must get 503. |
-| `stop` waits on a client that never reads | A `status` fault with a body far larger than any socket buffer, a client that never reads, and a test hook that signals when the write has started and not finished; only then is `stop` called, and it must return within the test's time limit. Run once on a real socket and once on a deterministic test `Io` where the write is made to block. |
+| `stop` waits on a client that never reads | On a deterministic test `Io` whose write blocks by construction, a client that never reads and a hook that signals the response write is blocked; only then is `stop` called, and it must return within the test's time limit. The same test on a real socket, with a body several times the two sockets' buffer sizes as the system reports them (and `limits` raised to allow it), is a smoke test only: it cannot prove the write had blocked. |
 | A value is sent without the final validation | A unit test that hands the send boundary a value its schema forbids must get 500. The plant removes that check; the test then sees a 200. |
 | Equality by source text (`[1, 1.0]` passes `uniqueItems`) | The JSON-Schema-Test-Suite `uniqueItems` cases. |
 
@@ -1023,8 +1107,9 @@ entry point), not inside a helper.
   or bounds that need many connections; those are Zig tests, written by us.
 - **JSON-Schema-Test-Suite** checks the validator, not the generator, the parameter decoding, or
   the OpenAPI-specific rules (`readOnly`, `writeOnly`, the directional `required` rule in 4.3).
-- **step** verifies signature, `iss`, `aud`, `exp` and `nbf` of tokens mock **issues**. It does not
-  test mock's **verifier**, and it cannot see scopes, revocation, `typ` or `kid`.
+- **step** verifies signature, `iss`, `aud`, `exp` and `nbf` of the ES256 and EdDSA tokens mock
+  **issues**. It does not test mock's **verifier** or HS256 tokens, and it cannot see scopes,
+  revocation, `typ` or `kid`.
 - **openssl** checks signatures only, not claims or the JOSE header.
 - **RFC vectors** are few and mostly well-formed; only A.5 is a negative case.
 - **Wycheproof** tests the signature primitives and our encoding of them (`R‖S`, base64url). It cannot

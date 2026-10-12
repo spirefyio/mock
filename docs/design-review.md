@@ -9,7 +9,9 @@ reviewed commit and the Zig 0.16.0 standard library before it is accepted, and i
 - **PARTIAL**: the mechanism is real, but the severity or the scope is not;
 - **REFUTED**: with the evidence that refutes it.
 
-The review is of a design, so nothing here is confirmed by measurement: no code exists yet.
+The review is of a design, so nothing here is confirmed by measurement: no code exists yet. A
+disposition says the finding holds; the Change column says what the design now says. Neither claims
+a chain is closed until a later pass reads the change.
 
 ## Pass 1
 
@@ -70,3 +72,68 @@ length-prefixed fields (3).
 
 The same commit fills **Borrowing candidates** (7) from the library survey, which the next pass
 reviews with the fixes.
+
+## Pass 2
+
+- Reviewed: the fix delta `08379e4..4fafcd5` (pass 1's fixes and the new Borrowing candidates),
+  read-only, with pass 1's findings and their dispositions.
+- Model: `gpt-6.1-sol`, reasoning effort `max`.
+- Verdict: **REWORK** — "malformed chunk acceptance, body-authentication ordering, incomplete error
+  contracts, and remaining ownership/resource/lifecycle gaps still prevent the promised defensive
+  guarantees."
+- Fixed in the commit that follows this record.
+
+Pass 1's findings: F1-F3, F6, F9-F11, F13, F16-F18, F20-F22, F24, F28-F30 closed. The residue the
+pass named in the others, each confirmed by reading the design at `4fafcd5`:
+
+| # | Residue | Change |
+|---|---|---|
+| F4 | The token store's strings had no ownership rule | The token store copies every string it keeps; `clear()` does not touch it (3) |
+| F5 | "At least its status" was false after a 100; no word on overflow, `clear` or refusals before a head | Guarantee restated: `pending` has no status; pre-head refusals get an entry; overflow and `clear` named (3) |
+| F7 | `Future.cancel` and `Group.cancel` are not thread-safe, and nothing serialized `stop` | One lifecycle lock over `start`, `stop`, `swapModel` and `deinit`; no task takes it (3) |
+| F8 | Issued token size, token-store bytes, fault bodies and generation work unbounded | Bounds rows for each (3) |
+| F12 | `default` ignored | See F33 |
+| F14 | 205 and 1xx | See F34 |
+| F15 | Field-value grammar, serialization, generated header values, `Content-Encoding` | All stated; `Content-Encoding` reserved (3) |
+| F16 | Validity is not authorization | Said so at the swap rule (2) |
+| F19 | Aggregation and malformed | See F35, F36 |
+| F23 | Equivalent IPv6 spellings and ports | The authority is parsed and compared as address, name and number (3) |
+| F25 | Body authentication against the 100 rule | See F32 |
+| F26 | `missing_scope` is wrong only where the scope is required | Stated in the defect table and below it (5.4) |
+| F27 | No negative tokens mock never issued | curl presents script-made tokens (8); see F37 |
+
+New findings:
+
+| # | Sev. | Finding (short) | Disposition and evidence | Change |
+|---|---|---|---|---|
+| F31 | HIGH | `std.http.ChunkParser` accepts malformed chunk framing | CONFIRMED-BY-READING: `lib/std/http/ChunkParser.zig:55-57` takes `A`-`Z` and `a`-`z` as digits, `:65-68` turns any other byte into an extension, `:79-85` skips extension bytes unchecked | mock's own strict decoder; ChunkParser named and refused (3); a plant (8) |
+| F32 | HIGH | 100 Continue waits on authentication, but `client_secret_post` sends credentials in the body | CONFIRMED-BY-READING: the 100 rule in 3 against 5.5 | Token endpoint exception (3, 5.5); a plant (8) |
+| F33 | MED | `default` ignored when choosing the error response | CONFIRMED-BY-READING: OpenAPI's Responses Object lets `default` cover undeclared codes | Exact code, then range, then `default`, for every status that stage answers (4.4); a plant (8) |
+| F34 | MED | 205 with content and 1xx as a final answer | CONFIRMED-BY-READING: RFC 9110 §15.3.6 | Status/content matrix; 1xx refused; 205 sends `Content-Length: 0` (3, 4.2, faults) |
+| F35 | MED | Two API keys required, one sent: no rule answered | CONFIRMED-BY-READING: none of the four conditions held | Outcomes decided together; rule 4 names the case; a plant (5.1, 8) |
+| F36 | MED | An unparseable JWT fit both 400 and 401 | CONFIRMED-BY-READING: RFC 6750 §3.1 gives `invalid_token` to a malformed token | Malformed narrowed to the request's authentication syntax (5.1); a plant (8) |
+| F37 | MED | step cannot verify HS256 with a public JWK; the fixture wrote a set | CONFIRMED-BY-READING for the HS256 half: 5.6 keeps HS256 secrets out of the JWK Set. How step's `--key` treats a set was not checked here; one key per file is right either way | step for ES256 and EdDSA only, one JWK file per key; HS256 to openssl; opaque tokens to neither (8) |
+| F38 | MED | The borrow-time procedure did not establish each file's effective terms | PARTIAL: the gap in the procedure is real; nothing has been borrowed, so no condition has been missed | Procedure rewritten: per-file terms, the chosen license for OR terms, module conditions, license texts (7) |
+| F39 | LOW | The http.zig row said `std.http.Server` is enough, against 3 | CONFIRMED-BY-READING | Row reworded (7) |
+| F40 | LOW | `Canceled` reported as `EntropyUnavailable` | CONFIRMED-BY-READING: `lib/std/Io.zig:2472` puts `Cancelable` in `RandomSecureError` | Both errors returned as they came (3) |
+
+Recommendations R19-R24: the pass agreed with all six, with qualifications that F31, F33, F35 and
+F36 carry. It noted that refusing `b64` outright is mock's policy, narrower than RFC 7797; 5.3 now
+says so.
+
+BALLAST it named, and what was done:
+
+- The stored-JWT plant could not catch removal of the store's kind check while shape dispatch
+  stands. Split into three rows: shape dispatch, the opaque expiry and revocation check, and the
+  kind check, which is the one plant asserted below the public boundary, with the reason (8).
+- Recording Wycheproof `acceptable` results has no failing expectation: they are now pinned to
+  mock's policy (8).
+- The real-socket blocked-writer run cannot prove the write had blocked: the deterministic `Io` run
+  is the check, and the real-socket run is labelled a smoke test (8).
+- Survey counts are not borrowing gates, and "exists nowhere" claimed too much: both reworded (7).
+- "Every case for a keyword" overstated restricted forms such as a non-integer `multipleOf`: such
+  cases are counted as refusals (8).
+- Custom auth schemes and `Prefer`: open questions, unchanged.
+
+From CHECKED CLEAN: std's drain before responding is conditional on keeping the connection alive
+(`lib/std/http/Server.zig:348-350`); section 3 now says so.

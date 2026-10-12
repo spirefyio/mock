@@ -145,9 +145,7 @@ From CHECKED CLEAN: std's drain before responding is conditional on keeping the 
 - Model: `gpt-6.1-sol`, reasoning effort `max`.
 - Verdict: **REWORK** — "the stated lifecycle contract can deadlock during cleanup, and the
   record-state and error-response guarantees still need correction."
-- Fixed in the commit that follows this record. **That fix delta has not had its own pass:** three
-  passes was the cap set for this design, so a fourth pass over it is owed before the design is
-  accepted.
+- Fixed in the commit that follows this record. That fix delta had its own pass, pass 4.
 
 Pass 2's items: F4, F8, F14-F16, F19, F23, F25-F27, F31, F32 and F34-F40 closed. F5, F7 and F33
 closed in part; what remained is F42, F41 and F44 below.
@@ -156,7 +154,7 @@ closed in part; what remained is F42, F41 and F44 below.
 |---|---|---|---|---|
 | F41 | HIGH | `deinit` takes the lifecycle lock and then calls `stop`, which takes it again | CONFIRMED-BY-READING: `Io.Mutex.lock` (`lib/std/Io.zig:1602`) waits on a held mutex and keeps no owner, so the second take never returns | Each public call takes the lock once; `deinit` runs the stop steps through internal functions; exclusive ownership at `deinit` stated; a plant (3, 8) |
 | F42 | MED | "A test that has received only a 100 finds it `pending`" promises a state the server may have left | CONFIRMED-BY-READING: the server may read the body and answer before the test looks | The entry exists after a 100, `pending` or later (3) |
-| F43 | LOW | The status for framing overhead past the head limit | PARTIAL: "any other breach is 400" excluded that case rather than giving it a second answer, but no status was stated for it | 431 past the limit, 413 for the body, 400 for malformed framing (3) |
+| F43 | LOW | The status for framing overhead past the head limit | PARTIAL: section 3 charged framing overhead to the request-head limit, which the Bounds table answers with 431, but "Any other breach is 400" in the same section gave that breach a second answer. *Corrected after pass 4 (F47): this said no status was stated, which was wrong.* | 431 past the limit, 413 for the body, 400 for malformed framing (3) |
 | F44 | LOW | Open question 2 restated the pass-1 rule without `default` | CONFIRMED-BY-READING | It now points at 4.4 (10) |
 
 Recommendations R25-R29 (the strict chunked decoder; 100 at the token endpoint before client
@@ -168,3 +166,29 @@ BALLAST it named, and what was done: three survey rows still claimed absence uni
 anywhere", "No Zig SAML IdP exists", "No licensed Zig 0.16 validator or executor exists"); each now
 says what the survey found (7). The real-socket blocked-writer run, survey counts, custom schemes and
 `Prefer` were judged correctly labelled; unchanged.
+
+## Pass 4
+
+- **Reviewed:** the fix delta `67e152b..5afe804` (pass 3's fixes), read-only, with pass 3's
+  findings and their dispositions. This pass also checked the whole document once for
+  contradictions between sections.
+- **Model:** `gpt-6.1-sol`, reasoning effort `max`.
+- **Verdict:** **ACCEPT WITH CHANGES**. The design still had to:
+  - resolve lifecycle cancellation;
+  - remove the contradiction about the body of a too-complex request;
+  - correct the F43 disposition.
+- **Fixed in:** the commit that follows this record, which gets its own pass.
+
+Pass 3's items:
+- F42, F43 and F44 are closed, as are the three survey wording items.
+- F41 is closed in part. No path takes the lock twice, but a cancelled acquisition was left
+  undefined (F45).
+
+| # | Sev. | Finding (short) | Disposition and evidence | Change |
+|---|---|---|---|---|
+| F45 | MED | Taking the lifecycle lock can be cancelled, and the design said nothing about it | CONFIRMED-BY-READING: `Io.Mutex.lock` returns `Cancelable!void` (`lib/std/Io.zig:1602`), while `stop` and `deinit` return `void`. `lockUncancelable` exists at `:1623`. | `stop` and `deinit` take the lock uncancelably. `start` and `swapModel` return `error.Canceled` with nothing changed. A plant covers it (3, 8). |
+| F46 | LOW | The Bounds table promised a `request-too-complex` problem document, but 4.4 answers with the operation's declared 413 first | CONFIRMED-BY-READING: the Bounds row and 4.4's error-response rule gave two bodies for one refusal. | The Bounds row now defers to 4.4, and the record keeps the reason either way (3). |
+| F47 | LOW | Pass 3's F43 disposition said no status was stated | CONFIRMED-BY-READING: at `67e152b` the Bounds table answered the head limit with 431, and section 3's "Any other breach is 400" contradicted it. | The F43 row is corrected where it stands (this file). |
+
+**BALLAST:** the pass named nothing new. It found the added `deinit` plant to be armor, provided
+the time limit is enforced outside the blocked call. Section 8 now says so.

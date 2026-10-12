@@ -242,3 +242,41 @@ Pass 5's items: the rest of F45, the rest of F46, and F48 are all closed.
 - Verdict: **ACCEPT**. F49 is closed, `stop`'s step order is unchanged, and no new defect was found.
 - **The review loop is closed:** this pass asked for no change. This record is the only commit after
   it, and it changes no design text.
+  *Reopened after pass 7: the maintainer's decisions on the open questions (`777a3eb`) changed the
+  design after this record, so the loop ran again from pass 8.*
+
+## Pass 8
+
+- **Reviewed:** the delta `7ff1697..777a3eb`, the maintainer's decisions written into the design,
+  read-only. The prompt carried four recommendations (R30–R33) for the pass to agree or disagree
+  with.
+- **Model:** `gpt-6.1-sol`, reasoning effort `max`.
+- **Verdict:** **ACCEPT WITH CHANGES**. The clock and signing contracts needed correcting, strict
+  `Prefer` handling needed to be marked as a deviation, `Vary` was missing, and one plant could not
+  turn red.
+- **Fixed in:** the commit that follows this record, which gets its own pass.
+
+RFC 7240 §2 was read for F52 and F53: a server that "does not recognize or is unable to comply
+with particular preference tokens … MUST ignore those tokens and continue processing instead of
+signaling an error", and "a Vary header field MUST be included in the response listing the Prefer
+header field regardless of whether the client actually used Prefer in the request".
+
+| # | Sev. | Finding (short) | Disposition and evidence | Change |
+|---|---|---|---|---|
+| F50 | MED | `set(t)` on a `.real` clock cannot make `now()` return `t` "from then on", and a `.real` clock set near the upper bound leaves the range a second later with nothing to stop it | CONFIRMED-BY-READING: 5.7 defines `.real` as the real-time clock plus an offset, so it keeps ticking after a `set`; the range was checked only on a move | `set` makes the clock read `t` at that instant: `.manual` stays there, `.real` takes the matching offset and ticks on. Every read is checked against the bound; out of range, `now()` and `idp.issue` return `error.ClockOutOfRange` and a request that needs the time gets 500 `clock-out-of-range` (5.7). A plant on a test `Io` steps real time past the bound (8). |
+| F51 | MED | "The two names sign the same bytes" is false: the protected header, `alg` included, is part of the signing input, so a relabelled token fails verification, and the step check that relied on relabelling cannot work | CONFIRMED-BY-READING: RFC 7515 §5.1 makes the JWS signing input the encoded protected header, a period and the encoded payload. The false sentence was written in this design at `777a3eb`. | Retracted at both sites. 5.2 says the two names share a primitive but not a signature, and a key verifies only its own name. The step check uses a second key configured as `EdDSA`, whose tokens mock issues and signs; `Ed25519` tokens go to openssl, which checks the signature over the signing input whatever the header says, and to mock's own header test (8). |
+| F52 | LOW | Refusing an unsatisfiable `code` or `example` with 400 departs from RFC 7240 §2, which requires ignoring a preference the server cannot comply with; the design said the RFC "allows" ignoring | CONFIRMED-BY-READING: the quoted §2 text above | "allows" becomes "requires". A paragraph marks the 400 as a deliberate deviation and gives the reason: a test asking for a 404 that gets a 200 through a typo would pass for the wrong reason (4.2). |
+| F53 | MED | Responses that `Prefer` can change carry no `Vary`, so a cache could answer an ordinary request with a response a preference chose | CONFIRMED-BY-READING: the quoted §2 text above | Every response 4.2 sends, the `preference-unsatisfiable` refusal included, carries one `Vary` field listing `Prefer`, and `Accept` when the media type was negotiated (RFC 9110 §12.5.5). A declared `Vary` keeps its members; a declared `*` is left alone (4.2). A plant drops mock's members (8). |
+| F54 | LOW | A frozen clock makes timestamps exact, not whole tokens: `jti` and the keys differ each time | CONFIRMED-BY-READING: 5.3 requires `jti`, unique per token (RFC 7519 §4.1.7), and section 3, Keys, makes fresh keys for every mock | The promise is narrowed to `iat`, `nbf` and `exp`; a test compares claims, not token bytes (5.7). |
+| F55 | LOW | Two summaries overstate their rules: "an ignored preference never silently turns into a success" contradicts ignoring `return=minimal` on a successful request, and section 10's "a refused request" stretches the validation-stage rule to authentication and `Prefer` refusals | CONFIRMED-BY-READING: 4.2 ignores every preference but `code` and `example`; 4.4's declared-shape rule covers only "a request this stage refuses" | 4.2 now says a `code` or `example` mock cannot satisfy never turns into a success. Section 10 item 2 says "refused by validation" and names the rules for the other two refusals. |
+
+**Recommendations.** R30, the identity clock moving apart from the server's own time: AGREE. R31,
+an unsatisfiable `code` or `example` refused with mock's problem document: AGREE, with F52's label.
+R32, acting only on `code` and `example`: AGREE. R33, a manual mode beside the offset clock: AGREE,
+with F54's narrower promise.
+
+**BALLAST:** of the five new plants, four were judged armor. "`Prefer` applied before
+authentication" was ballast as written: choosing a response early can still leave the 401 intact,
+so the plant might never turn the test red. It now sends the preferred response before
+authentication runs. The range plant now uses a `.manual` clock, so that real time cannot move
+`now()` under the "unchanged" assertion.

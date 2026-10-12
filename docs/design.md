@@ -609,7 +609,7 @@ ignored. It acts on two preferences:
   `code`, that is the success response.
 
 Every other preference, such as `return=minimal`, `respond-async` or `wait`, is ignored, as RFC
-7240 §2 allows. If a preference appears twice, only the first counts (RFC 7240 §2).
+7240 §2 requires. If a preference appears twice, only the first counts (RFC 7240 §2).
 
 What `Prefer` never does:
 - **It never skips a stage.** The Host check, routing, authentication and validation run first, so
@@ -622,8 +622,23 @@ An honoured preference is echoed in `Preference-Applied` (RFC 7240 §3), for exa
 nothing the operation declares, or a `code` value that is not a status from 200 to 599, is refused.
 The answer is 400 with mock's own problem document, of type `preference-unsatisfiable`, which lists
 the declared statuses and example names. It is never the operation's declared 400, because the
-mistake is in the request to the mock, not in the request to the API. An ignored preference never
-silently turns into a success.
+mistake is in the request to the mock, not in the request to the API. A `code` or `example` mock
+cannot satisfy therefore never silently turns into a success.
+
+That refusal is a deliberate deviation from RFC 7240, which requires a server that cannot comply
+with a preference to ignore it and carry on (§2). A mock's `code` and `example` are test controls,
+not hints: a test that asks for a 404 and is answered 200 because of a typo would pass for the
+wrong reason. The other preferences are ignored as the RFC requires.
+
+Because `Prefer` can change the response, every response this stage sends carries a `Vary` field
+that lists `Prefer`, whether or not the request had a `Prefer` header (RFC 7240 §2 requires that),
+so that a cache never answers an ordinary request with a response a preference chose. The
+`preference-unsatisfiable` refusal carries it too. The field also lists `Accept` whenever the
+response's media type was chosen by negotiation (RFC 9110 §12.5.5). If the operation declares a
+`Vary` response header, mock produces its value as for any declared header, then adds `Prefer` and
+`Accept` to that one field where they are missing, keeping its members; a declared `*` already
+covers both and is left alone. The added members are mock's own, like `Preference-Applied`, and are
+not checked against the declared header's schema.
 
 **Every value sent is validated against its schema first**, whatever its source: example,
 `default`, or generated, body or header. Examples and defaults are also validated when the model is
@@ -826,8 +841,11 @@ nothing and keeps the code safe to copy.
   `:292`). The Wycheproof run (section 8) records which way each edge case falls. Each key carries
   exactly one `alg` name. An Ed25519 key is configured as `Ed25519`, the RFC 9864 name that
   deprecates `EdDSA`, which is the default. It can also be configured as `EdDSA`, for clients whose
-  libraries know only the older name. The two names sign the same bytes and differ only in the
-  header's `alg`.
+  libraries know only the older name. The two names use the same primitive, but they are not
+  interchangeable on a token: the protected header, `alg` included, is part of the JWS signing
+  input (RFC 7515 §5.1), so a token issued under one name has a different signature from the same
+  token under the other, and renaming its `alg` breaks the signature. A key verifies only tokens
+  whose `alg` is its own name (5.3, step 4).
 
   RFC 9068 requires RS256 of conforming authorization and resource servers. Until RSA signing lands
   (6), mock's JWT access tokens follow RFC 9068's format but not that requirement.
@@ -862,8 +880,8 @@ RFC 8725. Each step refuses with its own reason, which goes into the 401 and the
    explicit typing, RFC 8725 §3.11), so that another kind of JWT, such as a future ID token, cannot
    be replayed as an access token (RFC 8725 §3.12).
 8. **Signature.** HS256: recompute the HMAC and compare with `timing_safe.eql`. ES256: the signature
-   must decode to exactly 64 bytes; a DER signature is refused, not converted. EdDSA: 64 bytes,
-   `Signature.verify`.
+   must decode to exactly 64 bytes; a DER signature is refused, not converted. Ed25519, under
+   either name: 64 bytes, `Signature.verify`.
 9. **Claims** (RFC 7519 §4.1, RFC 9068 §2.2): `iss`, `exp`, `aud`, `sub`, `client_id`, `iat` and
    `jti` must be present, with the right types: strings, and `aud` a string or an array of strings.
    `iss` equals the provider's issuer exactly; `aud` contains the service's audience exactly
@@ -955,14 +973,25 @@ A test can move that clock, so it can make a token expire without waiting for it
 
 - `Options.clock` is `.real` by default: the system's real-time clock plus an offset that starts at
   zero. `.{ .manual = t }` instead freezes the clock at `t` seconds since the Unix epoch, and it
-  then moves only when the test moves it. Every `iat` is then exact, so a test can compare whole
-  tokens.
+  then moves only when the test moves it. A frozen clock makes every `iat`, `nbf` and `exp` exact,
+  so a test can assert those values exactly. It does not make whole tokens repeatable: each token's
+  `jti` is unique to it (RFC 7519 §4.1.7) and each mock makes fresh keys (3, keys), so a test
+  compares claims, not token bytes.
 - `idp.clock.advance(seconds)` adds to the offset (`.real`) or to the frozen time (`.manual`). The
   number may be negative, so a test can step back to check `not_yet_valid`. `idp.clock.set(t)`
-  makes `now()` return `t` from then on, keeping the clock's mode. `idp.clock.now()` reads it.
+  makes the clock read `t` at that instant, keeping its mode: a `.manual` clock stays at `t`, and a
+  `.real` clock takes the offset that makes it read `t` then and goes on ticking from there.
+  `idp.clock.now()` reads it.
 - A move that would leave the clock before the epoch, or after 253402300799 (the last second of
   year 9999), is refused with `error.ClockOutOfRange`, and the clock is unchanged. That bound keeps
   every `exp` mock writes inside the range of a JSON number that clients read exactly.
+- A `.real` clock can still leave the range after a move, because real time runs on: one `set` to
+  the last second reads past it a second later. The system clock can be out of range by itself
+  too. So every read is checked against the same bound. Out of range, `now()` returns
+  `error.ClockOutOfRange`, and so does `idp.issue`. A request that needs the time, at the token
+  endpoint or to check a token, is answered 500 with mock's problem document of type
+  `clock-out-of-range`, and the record notes it. The check is arithmetic on the one reading, so it
+  never blocks, and no token is issued or accepted on a time outside the range.
 - `init` refuses a `.manual` start outside that range with the same error.
 - The mode is fixed at `init`, and the clock's state is one atomic word: the offset or the frozen
   time. So a test thread may move the clock while requests are being served. Each request reads it
@@ -1129,9 +1158,12 @@ and Zig tests only: no Python anywhere in the build, the tests or the tooling.
   (`uniqueItems` with `1` and `1.0`, objects in a different member order).
 - **step** (`step crypto jwt verify --key <public JWK> --iss <issuer> --aud <audience>`), for the
   ES256 and EdDSA tokens the mock issues, each verified with its own key's public JWK file (one key
-  per file, not the set). Ed25519 keys are checked under the `EdDSA` name, which step knows. The
-  default `Ed25519` name changes only the header's `alg`, and mock's own test checks that header
-  against RFC 9864. Whether step accepts the newer name has not been checked. HS256 tokens are not
+  per file, not the set). For step, the script configures a second Ed25519 key under the `EdDSA`
+  name, which step knows, and has mock issue and sign tokens with that key; an `Ed25519` token is
+  never relabelled, since that would break its signature (5.2). Tokens from a key under the default
+  `Ed25519` name are checked by openssl, which verifies the signature over the signing input
+  whatever the header says, and by mock's own test, which checks their header against RFC 9864.
+  Whether step accepts the newer name has not been checked. HS256 tokens are not
   given to step, since no public key verifies them;
   openssl checks those. Opaque tokens are not JWTs and go to neither. A good token must verify.
   Of the defective ones, step is expected to reject
@@ -1143,8 +1175,8 @@ and Zig tests only: no Python anywhere in the build, the tests or the tooling.
   signature the script changes by one character must fail.
 - **openssl**, a second signature check over the token's signing input: for HS256 the script
   computes the MAC with `openssl dgst -sha256 -mac HMAC -macopt hexkey:<key>` and compares it with
-  the token's signature; for Ed25519 it runs `openssl pkeyutl -verify -rawin` with the public key as
-  PEM. Both must agree with mock on good and tampered tokens.
+  the token's signature; for Ed25519, under either name, it runs `openssl pkeyutl -verify -rawin`
+  with the public key as PEM. Both must agree with mock on good and tampered tokens.
 - **Published vectors**, as Zig tests at the JWS layer:
   - RFC 7515 Appendix A.1 (HS256) and A.3 (ES256) must verify; A.5, an unsecured JWS, must be
     refused under mock's `alg: none` rule;
@@ -1196,10 +1228,12 @@ entry point), not inside a helper, except where a row says why it cannot be.
 | A cancelled lock acquisition treated as taken | A `stop` holds the lifecycle lock, blocked on a test hook, and a `swapModel` waiting for the lock is cancelled. The `swapModel` must return `error.Canceled`, and the old model must still serve. A second lifecycle call made meanwhile must stay blocked until the `stop` returns, which shows the lock was never released by the cancelled call. The hook is released independently of the cancelled call. |
 | Cleanup that stops at a cancellation | Cancel the task that calls `stop` on a running mock with open connections, both while it waits for the lock and while it shuts sockets down. `stop` must still return with every socket in the live-connection table shut down and every task awaited. The plant removes the cancel protection, and the test then sees a socket left open or a task left running. |
 | The verifier reads the real clock instead of the identity clock | Issue a one-hour token, `idp.clock.advance(3601)`, and present it: it must be refused as `expired`. The plant makes the verifier read the real clock, and the test then sees 200. A `.manual` clock frozen at `t` must issue a token whose `iat` is exactly `t`. |
-| A clock move leaves the range | `advance` past year 9999, or `set(-1)`, must return `error.ClockOutOfRange` and leave `now()` unchanged. |
+| A clock move leaves the range | On a `.manual` clock, so that nothing else moves it, `advance` past year 9999, or `set(-1)`, must return `error.ClockOutOfRange` and leave `now()` unchanged. The plant removes the range check, and `now()` then reads the out-of-range time. |
+| A `.real` clock read past the bound is used | On a test `Io` whose real-time clock the test steps, `set` the identity clock to the last second of year 9999 and step real time by two seconds: a request to the token endpoint must get 500 of type `clock-out-of-range`, and `idp.issue` must return `error.ClockOutOfRange`. The plant removes the read check, and the test then sees 200 and a token whose `iat` is past the bound. |
 | `Prefer` ignored | `curl -H 'Prefer: code=404'` on an operation that declares a 404 must get that response, with `Preference-Applied: code=404`. The plant ignores the header, and the test then sees 200. |
 | `Prefer` read too loosely | `Prefer: return=minimal` alone must change nothing. `Prefer: code=418` on an operation with no `4XX` or `default` must get 400 of type `preference-unsatisfiable`, not a success and not the operation's declared 400. |
-| `Prefer` applied before authentication | `Prefer: code=200` without credentials on a secured operation must still get 401. The plant chooses the response before authentication runs. |
+| `Prefer` applied before authentication | `Prefer: code=200` without credentials on a secured operation must still get 401. The plant sends the preferred response as soon as `Prefer` is read, before authentication runs, and the test then sees 200. |
+| `Vary: Prefer` missing | A request with no `Prefer` header must get a response whose `Vary` lists `Prefer`. On an operation that declares a `Vary: Origin` response header, the response must carry one `Vary` field listing `Origin` and `Prefer`. The plant drops mock's members, and a cache keyed without `Prefer` would then serve a preferred 404 to an ordinary request. |
 | A value is sent without the final validation | A unit test that hands the send boundary a value its schema forbids must get 500. The plant removes that check; the test then sees a 200. |
 | Equality by source text (`[1, 1.0]` passes `uniqueItems`) | The JSON-Schema-Test-Suite `uniqueItems` cases. |
 
@@ -1324,10 +1358,12 @@ pub const Options = struct {
 The design's open questions, as the maintainer answered them on 2026-10-12:
 
 1. **The client-credentials token endpoint ships in the first slice** (5.5).
-2. **A refused request is answered with the API's own declared error shape by default**, and with
-   mock's problem document only when the operation declares none (4.4). A mock that answers in the
-   API's shape lets that shape be tested, and fixed where it is wrong. `.problem_document` remains
-   an option.
+2. **A request refused by validation is answered with the API's own declared error shape by
+   default**, and with mock's problem document only when the operation declares none (4.4). A mock
+   that answers in the API's shape lets that shape be tested, and fixed where it is wrong.
+   `.problem_document` remains an option. Refusals from other stages keep their own rules: a failed
+   credential is a 401 with a challenge and mock's problem document (5.1), and a `Prefer` the mock
+   cannot satisfy is a 400 with mock's problem document (4.2).
 3. **Custom auth schemes are left out for now** and recorded as a future addition (6).
 4. **There is a settable test clock**, so a test never waits for a token to expire (5.7).
 5. **A swap that adds or removes a service is refused** (2).
